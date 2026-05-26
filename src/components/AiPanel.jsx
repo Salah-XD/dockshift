@@ -50,6 +50,19 @@ export default function AiPanel({ isOpen, onClose, anchorRect }) {
   // Tracks the in-flight stream so chunk/done/error events can be matched to it.
   const activeStreamRef = useRef(null);
 
+  // If the user closes the AI panel while a stream is in flight, tell main
+  // to abort it. Otherwise the provider keeps streaming (and consuming tokens)
+  // until the idle timeout fires — wasteful, and on closed-source providers,
+  // expensive.
+  useEffect(() => {
+    if (isOpen) return;
+    const streamId = activeStreamRef.current;
+    if (!streamId) return;
+    activeStreamRef.current = null;
+    api?.invoke?.('ai:streamAbort', { streamId })?.catch(() => {});
+    setLoading(false);
+  }, [isOpen, api]);
+
   // Re-check provider/key status whenever the panel opens — the user may have
   // switched providers or added a key in Settings since it was last open.
   useEffect(() => {

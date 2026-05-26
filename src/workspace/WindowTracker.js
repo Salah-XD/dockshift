@@ -1,5 +1,13 @@
 import { execFile, spawn } from 'child_process';
 import { setTimeout as wait } from 'timers/promises';
+import path from 'path';
+import fs from 'fs';
+
+function toFiniteInt(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  return Math.trunc(n);
+}
 
 /**
  * @typedef {import('./SnapshotManager').AppWindowSnapshot} AppWindowSnapshot
@@ -322,6 +330,18 @@ $results | ConvertTo-Json -Depth 6 -Compress
    */
   async setWindowBoundsByHwnd(hwnd, bounds) {
     if (process.platform !== 'win32') return;
+    // Every value is interpolated into a PowerShell here-string. Coerce to
+    // integers first — anything non-finite is rejected so a tampered snapshot
+    // JSON (e.g. bounds.x = "0; Start-Process calc.exe") cannot inject script.
+    const h = toFiniteInt(hwnd);
+    const x = toFiniteInt(bounds?.x);
+    const y = toFiniteInt(bounds?.y);
+    const w = toFiniteInt(bounds?.width);
+    const ht = toFiniteInt(bounds?.height);
+    if (h === null || x === null || y === null || w === null || ht === null) {
+      console.warn('[WindowTracker] Rejecting setWindowBoundsByHwnd: non-numeric input', { hwnd, bounds });
+      return;
+    }
     const psScript = `
 Add-Type -TypeDefinition @"
 using System;
@@ -331,10 +351,10 @@ public class Win32Move {
 }
 "@
 
-$HWND = [IntPtr]${hwnd}
+$HWND = [IntPtr]${h}
 $SWP_NOZORDER = 0x0004
 $SWP_NOACTIVATE = 0x0010
-[void][Win32Move]::SetWindowPos($HWND, [IntPtr]::Zero, ${bounds.x}, ${bounds.y}, ${bounds.width}, ${bounds.height}, ($SWP_NOZORDER -bor $SWP_NOACTIVATE))
+[void][Win32Move]::SetWindowPos($HWND, [IntPtr]::Zero, ${x}, ${y}, ${w}, ${ht}, ($SWP_NOZORDER -bor $SWP_NOACTIVATE))
 `;
     await this.execPowerShell(psScript);
   }
@@ -343,7 +363,25 @@ $SWP_NOACTIVATE = 0x0010
    * @param {AppWindowSnapshot} snap
    */
   async launchAndPositionApp(snap) {
-    const child = spawn(snap.executablePath, snap.launchArgs || [], {
+    // Snapshots are user-writable JSON in userData/workspaces. Validate the
+    // exe path and args before spawn so a tampered snapshot cannot pivot us
+    // into launching cmd.exe / powershell.exe with attacker-chosen argv.
+    const exe = snap.executablePath;
+    if (typeof exe !== 'string' || !path.isAbsolute(exe) || exe.includes('..')) {
+      throw new Error(`Refusing to launch: invalid executablePath ${JSON.stringify(exe)}`);
+    }
+    if (!/\.exe$/i.test(exe)) {
+      throw new Error(`Refusing to launch non-.exe target ${JSON.stringify(exe)}`);
+    }
+    if (!fs.existsSync(exe)) {
+      throw new Error(`Refusing to launch: executable not found ${JSON.stringify(exe)}`);
+    }
+    const args = Array.isArray(snap.launchArgs) ? snap.launchArgs : [];
+    if (args.length > 32 || !args.every((a) => typeof a === 'string' && a.length < 4096)) {
+      throw new Error('Refusing to launch: invalid launchArgs');
+    }
+
+    const child = spawn(exe, args, {
       detached: true,
       stdio: 'ignore',
     });

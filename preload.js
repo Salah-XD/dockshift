@@ -49,6 +49,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
       'ai:listModels',
       'ai:chat',
       'ai:chatStream',
+      'ai:streamAbort',
       'ai:transcribe',
       // Voice-to-Text (provider-agnostic transcription)
       'transcription:providers',

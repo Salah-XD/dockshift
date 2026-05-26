@@ -604,7 +604,7 @@ function createWindow() {
   });
 
   const isDevelopment = process.env.NODE_ENV === 'development' || !app.isPackaged;
-  const devPort = process.env.VITE_PORT || '5179';
+  const devPort = process.env.VITE_PORT || '5173';
   const indexPath = isDevelopment
     ? `http://localhost:${devPort}`
     : `file://${path.join(__dirname, 'dist', 'index.html')}`;
@@ -682,7 +682,7 @@ function createWelcomeWindow() {
   });
 
   const isDevelopment = process.env.NODE_ENV === 'development' || !app.isPackaged;
-  const devPort = process.env.VITE_PORT || '5179';
+  const devPort = process.env.VITE_PORT || '5173';
   const url = isDevelopment
     ? `http://localhost:${devPort}/#welcome`
     : `file://${path.join(__dirname, 'dist', 'index.html')}#welcome`;
@@ -1078,8 +1078,22 @@ class AiTimeoutError extends Error {
  * resets every time a chunk arrives (idle/streaming mode). Otherwise the
  * timer is a single hard deadline (total/non-streaming mode).
  */
-async function runChatWithTimeout(prompt, onChunk, { totalMs, idleMs, firstChunkMs }) {
+async function runChatWithTimeout(prompt, onChunk, { totalMs, idleMs, firstChunkMs, externalSignal }) {
   const ctrl = new AbortController();
+  // If the caller hands us an external signal (e.g. the streamId-keyed
+  // controller from ai:chatStream), forward its abort into ours so the
+  // provider's `fetch` actually cancels mid-stream.
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      ctrl.abort(externalSignal.reason || new Error('Aborted'));
+    } else {
+      externalSignal.addEventListener(
+        'abort',
+        () => { if (!ctrl.signal.aborted) ctrl.abort(externalSignal.reason || new Error('Aborted')); },
+        { once: true },
+      );
+    }
+  }
   let timer = null;
   let receivedChunk = false;
   const trip = (msg) => {
@@ -1137,9 +1151,15 @@ ipcMain.handle('ai:chat', async (_e, { prompt }) => {
 // Streaming chat. The renderer calls this, then listens on the push channels
 // `ai:streamChunk` / `ai:streamDone` / `ai:streamError`, all tagged with the
 // `streamId` returned here so multiple panels could stream independently.
+// Renderers can cancel an in-flight stream via ai:streamAbort — keeps the
+// provider's `fetch` from running to completion (and burning tokens) after
+// the user closes the AI panel.
 let _streamSeq = 0;
+const streamControllers = new Map();
 ipcMain.handle('ai:chatStream', async (e, { prompt }) => {
   const streamId = `s${++_streamSeq}`;
+  const ctrl = new AbortController();
+  streamControllers.set(streamId, ctrl);
   const send = (channel, payload) => {
     if (e.sender && !e.sender.isDestroyed()) e.sender.send(channel, { streamId, ...payload });
   };
@@ -1150,16 +1170,31 @@ ipcMain.handle('ai:chatStream', async (e, { prompt }) => {
       const text = await runChatWithTimeout(
         prompt,
         (delta) => send('ai:streamChunk', { delta }),
-        { idleMs: AI_STREAM_IDLE_TIMEOUT_MS, firstChunkMs: AI_STREAM_FIRST_CHUNK_TIMEOUT_MS },
+        {
+          idleMs: AI_STREAM_IDLE_TIMEOUT_MS,
+          firstChunkMs: AI_STREAM_FIRST_CHUNK_TIMEOUT_MS,
+          externalSignal: ctrl.signal,
+        },
       );
       send('ai:streamDone', { text: text || 'No response.' });
     } catch (err) {
       console.error('[AI:chatStream] Error:', err.message);
-      const code = err instanceof AiTimeoutError ? 'TIMEOUT' : (err.code || undefined);
+      const code = err instanceof AiTimeoutError
+        ? 'TIMEOUT'
+        : (ctrl.signal.aborted ? 'ABORTED' : (err.code || undefined));
       send('ai:streamError', { error: err.message || 'Failed to get response', code });
+    } finally {
+      streamControllers.delete(streamId);
     }
   })();
   return { streamId };
+});
+
+ipcMain.handle('ai:streamAbort', (_e, { streamId } = {}) => {
+  const ctrl = streamControllers.get(streamId);
+  if (!ctrl) return { ok: false };
+  ctrl.abort(new Error('Stream aborted by renderer'));
+  return { ok: true };
 });
 
 // ─── Vosk offline speech model — download + cache + custom protocol ─────────
@@ -1611,13 +1646,75 @@ function applySettings(settings) {
 }
 
 ipcMain.handle('settings:get', () => readSettings());
+
+// Per-key validators for `settings:set`. The renderer could be compromised
+// (XSS in NotesPanel, malicious extension) and would otherwise be able to
+// stuff arbitrary URLs into sttEndpoints to exfiltrate voice/AI prompts, or
+// flip clipboardMaxItems to 2^31 to balloon disk usage. Unknown keys are
+// dropped silently — adding a new setting requires updating this table.
+const SETTINGS_SCHEMA = {
+  theme: (v) => (['light', 'dark', 'system'].includes(v) ? v : undefined),
+  dockPosition: (v) => (['bottom-center', 'bottom-right', 'bottom-left', 'top-center'].includes(v) ? v : undefined),
+  alwaysOnTop: (v) => (typeof v === 'boolean' ? v : undefined),
+  launchOnStartup: (v) => (typeof v === 'boolean' ? v : undefined),
+  clipboardMaxItems: (v) => (Number.isFinite(v) && v >= 10 && v <= 1000 ? Math.trunc(v) : undefined),
+  toggleDockShortcut: (v) => (typeof v === 'string' && v.length <= 64 ? v : undefined),
+  analyticsEnabled: (v) => (typeof v === 'boolean' ? v : undefined),
+  hasCompletedWelcome: (v) => (typeof v === 'boolean' ? v : undefined),
+  aiProvider: (v) => (typeof v === 'string' && v.length <= 32 ? v : undefined),
+  aiModel: (v) => (typeof v === 'string' && v.length <= 128 ? v : undefined),
+  sttProvider: (v) => (typeof v === 'string' && v.length <= 32 ? v : undefined),
+  sttLanguage: (v) => (typeof v === 'string' && v.length <= 16 ? v : undefined),
+  sttEndpoints: (v) => {
+    if (!v || typeof v !== 'object' || Array.isArray(v)) return undefined;
+    const out = {};
+    for (const [providerId, url] of Object.entries(v)) {
+      if (!/^[a-z0-9-]{1,32}$/i.test(providerId)) continue;
+      if (url === '' || url == null) { out[providerId] = ''; continue; }
+      if (typeof url !== 'string' || url.length > 1024) continue;
+      // Endpoint URLs must be https:// — http:// would let a renderer
+      // compromise downgrade voice exfiltration to plaintext, and any other
+      // scheme is meaningless to `fetch`.
+      try {
+        const parsed = new URL(url);
+        if (parsed.protocol !== 'https:') continue;
+        out[providerId] = url;
+      } catch (_) { /* invalid URL — drop */ }
+    }
+    return out;
+  },
+  dockBarPos: (v) => {
+    if (!v || typeof v !== 'object' || Array.isArray(v)) return undefined;
+    const x = Number(v.x), y = Number(v.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return undefined;
+    return { x: Math.trunc(x), y: Math.trunc(y) };
+  },
+  terminalFontSize: (v) => (Number.isFinite(v) && v >= 6 && v <= 72 ? Math.trunc(v) : undefined),
+  receivePrerelease: (v) => (typeof v === 'boolean' ? v : undefined),
+  shellIntegrationVersion: (v) => (Number.isFinite(v) ? Math.trunc(v) : undefined),
+};
+
+function sanitizeSettings(input) {
+  if (!input || typeof input !== 'object') return {};
+  const out = {};
+  for (const [key, value] of Object.entries(input)) {
+    const validator = SETTINGS_SCHEMA[key];
+    if (!validator) continue;
+    const cleaned = validator(value);
+    if (cleaned !== undefined) out[key] = cleaned;
+  }
+  return out;
+}
+
 ipcMain.handle('settings:set', (_e, { settings }) => {
-  // Merge rather than overwrite: callers (Settings panel, ThemeContext, …)
+  // Sanitize first — drop unknown keys, reject bad types, enforce https on
+  // endpoint URLs. Then merge: callers (Settings panel, ThemeContext, …)
   // each own only a subset of keys, so a partial write must not wipe the rest.
-  writeJsonAtomic(settingsFile(), { ...readSettings(), ...settings });
+  const safe = sanitizeSettings(settings);
+  writeJsonAtomic(settingsFile(), { ...readSettings(), ...safe });
   // Apply only what changed — applySettings guards each key by presence, so
   // toggling the theme won't, say, re-snap a window the user dragged.
-  applySettings(settings);
+  applySettings(safe);
   return { ok: true };
 });
 
@@ -1755,6 +1852,13 @@ ipcMain.handle('launcher:search', (_e, { query }) => {
   return out;
 });
 
+// Set of paths that the `type=system` branch is allowed to launch via
+// `cmd.exe /c start`. Derived from SYSTEM_COMMANDS; anything else is a
+// renderer-supplied string and must not resolve through PATH.
+const SYSTEM_COMMAND_PATHS = new Set(
+  SYSTEM_COMMANDS.map((c) => c.path.toLowerCase())
+);
+
 ipcMain.handle('launcher:open', async (_e, { path: appPath, type }) => {
   try {
     // Validate appPath to prevent injection
@@ -1767,6 +1871,13 @@ ipcMain.handle('launcher:open', async (_e, { path: appPath, type }) => {
       if (!/^ms-[a-z]+:/i.test(appPath)) throw new Error('Invalid system URI');
       await shell.openExternal(appPath);
     } else if (type === 'system') {
+      // `cmd.exe /c start "" <name>` resolves <name> against PATH (and as a
+      // registered URI scheme). A renderer compromise that hands us an
+      // arbitrary string would pick up whatever's on PATH first, so only
+      // launch entries that match the SYSTEM_COMMANDS allowlist by path.
+      if (!SYSTEM_COMMAND_PATHS.has(appPath.toLowerCase())) {
+        throw new Error('Unknown system command');
+      }
       // Use spawn with argument array instead of exec to prevent command injection
       const child = spawn('cmd.exe', ['/c', 'start', '""', appPath], {
         detached: true, stdio: 'ignore'
@@ -2399,6 +2510,23 @@ app.on('web-contents-created', (event, contents) => {
     shell.openExternal(url);
     return { action: 'deny' };
   });
+
+  // Defense-in-depth for the BrowserPanel <webview>: scrub webPreferences on
+  // every attach so a future renderer compromise that sets `nodeintegration`
+  // or `disablewebsecurity` attributes on the tag is overridden by main.
+  contents.on('will-attach-webview', (_evt, webPreferences, params) => {
+    delete webPreferences.preload;
+    webPreferences.nodeIntegration = false;
+    webPreferences.contextIsolation = true;
+    webPreferences.sandbox = true;
+    webPreferences.webSecurity = true;
+    webPreferences.allowRunningInsecureContent = false;
+    // Force the documented partition; reject anything else (a hostile renderer
+    // could try to read another partition's cookies by overriding this).
+    if (params.partition && params.partition !== 'persist:browser') {
+      params.partition = 'persist:browser';
+    }
+  });
 });
 
 // Renderer is mounted and listening for `shell:openPanel` / `notify`. If we
@@ -2621,5 +2749,27 @@ app.on('will-quit', () => {
   if (heartbeatTimer) {
     clearInterval(heartbeatTimer);
     heartbeatTimer = null;
+  }
+  // Kill the PTY explicitly. The OS would reap it on Electron exit, but on a
+  // hard-quit (SIGKILL, crash) the child can survive briefly with the
+  // inherited stdio handles.
+  if (ptyProcess) {
+    try { ptyProcess.kill(); } catch (_) { /* already dead */ }
+    ptyProcess = null;
+  }
+  // The fade interval is short (~180ms) but if the user hides/shows then quits
+  // within that window, the interval holds the event loop alive needlessly.
+  if (toggleFadeTimer) {
+    clearInterval(toggleFadeTimer);
+    toggleFadeTimer = null;
+  }
+  // Flush a pending dock-layout write synchronously so a fast-quit doesn't
+  // race the debounce and drop the user's last layout change.
+  if (dockLayoutWriteTimer) {
+    clearTimeout(dockLayoutWriteTimer);
+    dockLayoutWriteTimer = null;
+    try {
+      writeJsonAtomic(dockLayoutFile(), currentDockLayout);
+    } catch (_) { /* already-quit edge cases */ }
   }
 });

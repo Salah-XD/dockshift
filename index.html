@@ -3,6 +3,32 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      Content Security Policy.
+      - script-src 'self' (no 'unsafe-inline'): blocks the NotesPanel innerHTML
+        XSS path — an injected `<img onerror=...>` in a saved note can't run.
+        'wasm-unsafe-eval' is needed by vosk-browser for the WASM runtime.
+      - style-src allows inline styles: every component uses style={...} props
+        which React renders as inline style attributes.
+      - connect-src includes http://127.0.0.1:11434 for Ollama and http(s)://localhost
+        + ws://localhost for the Vite dev server's HMR socket. https: blanket
+        permits Gemini / OpenAI / Anthropic / OpenRouter, gated separately at
+        the AI provider switch.
+      - vosk-model: is our custom protocol for the offline speech model.
+    -->
+    <meta http-equiv="Content-Security-Policy" content="
+      default-src 'self';
+      script-src 'self' 'wasm-unsafe-eval';
+      style-src 'self' 'unsafe-inline';
+      img-src 'self' data: blob: https: vosk-model:;
+      font-src 'self' data:;
+      connect-src 'self' https: http://127.0.0.1:11434 http://localhost:* ws://localhost:* vosk-model:;
+      media-src 'self' blob: data:;
+      worker-src 'self' blob:;
+      object-src 'none';
+      base-uri 'self';
+      form-action 'none';
+    " />
     <title>DockShift</title>
   </head>
   <body>
