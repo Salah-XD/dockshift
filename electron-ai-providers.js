@@ -300,6 +300,7 @@ const ollama = {
   ],
   defaultModel: 'llama3.2',
   canTranscribe: false,
+  setupHint: 'Ollama runs locally — no API key needed. Make sure the Ollama app is running and the model is pulled.',
 
   async listModels() {
     // Keyless and local — lists exactly the models the user has pulled.
@@ -407,6 +408,8 @@ export const PROVIDER_LIST = [gemini, openai, anthropic, ollama, openrouter].map
   models: p.models,
   defaultModel: p.defaultModel,
   canTranscribe: p.canTranscribe,
+  // Optional hint surfaced by the Settings UI for keyless providers (e.g. Ollama).
+  setupHint: p.setupHint || null,
 }));
 
 export function getProvider(id) {

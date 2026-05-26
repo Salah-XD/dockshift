@@ -53,12 +53,21 @@ export default function AiSettings({ settings, update, api }) {
   useEffect(() => {
     api?.invoke?.('ai:providers')
       ?.then((res) => {
-        setProviders(Array.isArray(res?.providers) ? res.providers : []);
+        const list = Array.isArray(res?.providers) ? res.providers : [];
+        setProviders(list);
         setEncryptionAvailable(res?.encryptionAvailable !== false);
+        // Self-heal stale settings: if the saved provider isn't in the catalog
+        // (e.g. removed in an update), drop the user onto the first visible
+        // option so the dropdown isn't stuck on a phantom id.
+        if (list.length && settings.aiProvider && !list.find((p) => p.id === settings.aiProvider)) {
+          const next = list[0];
+          update('aiProvider', next.id);
+          update('aiModel', next.defaultModel);
+        }
       })
       ?.catch(() => {});
     refreshKeys();
-  }, [api, refreshKeys]);
+  }, [api, refreshKeys, settings.aiProvider, update]);
 
   // Clear the draft + any notice when switching providers.
   useEffect(() => { setKeyDraft(''); setNotice(null); }, [activeId]);
@@ -192,8 +201,8 @@ export default function AiSettings({ settings, update, api }) {
       {activeProvider?.keyless ? (
         <SettingRow>
           <Callout tone="neutral" style={{ marginBottom: 'var(--ds-space-3)' }}>
-            {activeProvider.label} runs locally — no API key needed. Make sure the
-            Ollama app is running and the model is pulled.
+            {activeProvider.setupHint
+              || `${activeProvider.label} runs locally — no API key needed.`}
           </Callout>
         </SettingRow>
       ) : (

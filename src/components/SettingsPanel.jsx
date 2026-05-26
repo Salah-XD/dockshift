@@ -4,6 +4,7 @@ import { HEADER_STYLE, TITLE_STYLE, SCROLL_AREA } from '../hooks/usePanelPositio
 import { useTheme } from '../context/ThemeContext';
 import ResizablePanel from './ResizablePanel';
 import AiSettings from './AiSettings';
+import VoiceSettings from './VoiceSettings';
 import {
   Badge,
   Button,
@@ -107,6 +108,10 @@ export default function SettingsPanel({ isOpen, onClose, anchorRect }) {
 
         <SectionGroup title="AI & Models">
           <AiSettings settings={settings} update={update} api={api} />
+        </SectionGroup>
+
+        <SectionGroup title="Voice to Text">
+          <VoiceSettings settings={settings} update={update} api={api} />
         </SectionGroup>
 
         <SectionGroup title="System">

@@ -176,7 +176,7 @@ export default function BrowserPanel({ isOpen, onClose, anchorRect }) {
           ref={webviewRef}
           src={currentUrl}
           partition="persist:browser"
-          allowpopups="false"
+          allowpopups="true"
           style={{
             flex: 1,
             borderRadius: 'var(--ds-radius-md)',

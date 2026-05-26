@@ -50,6 +50,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
       'ai:chat',
       'ai:chatStream',
       'ai:transcribe',
+      // Voice-to-Text (provider-agnostic transcription)
+      'transcription:providers',
+      'transcription:transcribe',
+      'transcription:test',
+      // On-device speech model management (Vosk WASM)
+      'stt:voskModel:status',
+      'stt:voskModel:download',
+      'stt:voskModel:remove',
       // Secrets (encrypted API key storage — names only cross this boundary)
       'secrets:set',
       'secrets:has',

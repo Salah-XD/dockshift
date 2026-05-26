@@ -1,4 +1,4 @@
-import { app, BrowserWindow, globalShortcut, screen, ipcMain, clipboard, nativeImage, shell, desktopCapturer, Tray, Menu } from 'electron';
+import { app, BrowserWindow, globalShortcut, screen, ipcMain, clipboard, nativeImage, shell, desktopCapturer, Tray, Menu, protocol } from 'electron';
 import { fileURLToPath } from 'url';
 import path from 'path';
 import fs from 'fs';
@@ -12,12 +12,32 @@ import { TerminalManager } from './src/workspace/TerminalManager.js';
 import { readJson, writeJsonAtomic, setCorruptionNotifier } from './electron-persistence.js';
 import { setSecret, getSecret, hasSecret, deleteSecret, listSecrets, isEncryptionAvailable } from './electron-secrets.js';
 import { PROVIDER_LIST, getProvider } from './electron-ai-providers.js';
+import {
+  TRANSCRIPTION_PROVIDER_LIST,
+  DEFAULT_TRANSCRIPTION_PROVIDER_ID,
+  getTranscriptionProvider,
+  runTranscription,
+  testTranscriptionProvider,
+  TranscriptionError,
+} from './electron-transcription-providers.js';
 import { installShellIntegration, uninstallShellIntegration, isShellIntegrationInstalled, SHELL_INTEGRATION_VERSION } from './electron-shell-integration.js';
 // electron-updater is CommonJS — interop via the default import.
 import electronUpdater from 'electron-updater';
 const { autoUpdater } = electronUpdater;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// ─── Custom protocol for the Vosk model file ──────────────────────────────────
+// Must be registered as privileged BEFORE app.ready, so the renderer's `fetch`
+// can load `vosk-model://en-us-small` like any other URL. The model file lives
+// in userData/voskModels/ after first-use download; the actual handler in
+// app.ready maps the protocol path to that file.
+protocol.registerSchemesAsPrivileged([
+  {
+    scheme: 'vosk-model',
+    privileges: { standard: true, secure: true, supportFetchAPI: true, bypassCSP: true, stream: true },
+  },
+]);
 
 // ─── Load .env ────────────────────────────────────────────────────────────────
 // Minimal .env parser (no dotenv dependency). Handles `KEY=value`, surrounding
@@ -584,7 +604,7 @@ function createWindow() {
   });
 
   const isDevelopment = process.env.NODE_ENV === 'development' || !app.isPackaged;
-  const devPort = process.env.VITE_PORT || '5173';
+  const devPort = process.env.VITE_PORT || '5179';
   const indexPath = isDevelopment
     ? `http://localhost:${devPort}`
     : `file://${path.join(__dirname, 'dist', 'index.html')}`;
@@ -662,7 +682,7 @@ function createWelcomeWindow() {
   });
 
   const isDevelopment = process.env.NODE_ENV === 'development' || !app.isPackaged;
-  const devPort = process.env.VITE_PORT || '5173';
+  const devPort = process.env.VITE_PORT || '5179';
   const url = isDevelopment
     ? `http://localhost:${devPort}/#welcome`
     : `file://${path.join(__dirname, 'dist', 'index.html')}#welcome`;
@@ -1142,25 +1162,288 @@ ipcMain.handle('ai:chatStream', async (e, { prompt }) => {
   return { streamId };
 });
 
-ipcMain.handle('ai:transcribe', async (_e, { audio, language }) => {
+// ─── Vosk offline speech model — download + cache + custom protocol ─────────
+//
+// The renderer's Voice panel uses `vosk-browser` to run speech recognition
+// entirely on-device (WASM in a Web Worker, no network). The model is too big
+// to ship in the installer, so it's downloaded once on first use, cached in
+// userData, and served back to the renderer via the `vosk-model://` protocol.
+
+const VOSK_MODELS = {
+  'en-us-small': {
+    url: 'https://ccoreilly.github.io/vosk-browser/models/vosk-model-small-en-us-0.15.tar.gz',
+    expectedBytes: 40 * 1024 * 1024, // ~40 MB — used for progress when the server omits Content-Length
+    label: 'English (small)',
+  },
+};
+
+const DEFAULT_VOSK_MODEL_ID = 'en-us-small';
+
+function voskModelsDir() {
+  return path.join(app.getPath('userData'), 'voskModels');
+}
+function voskModelPath(id) {
+  return path.join(voskModelsDir(), `${id}.tar.gz`);
+}
+function ensureVoskDir() {
+  fs.mkdirSync(voskModelsDir(), { recursive: true });
+}
+
+/**
+ * Inspect what's cached on disk. The renderer calls this to decide whether to
+ * show the "Download model" prompt or jump straight to recording.
+ */
+ipcMain.handle('stt:voskModel:status', (_e, payload = {}) => {
+  const id = payload.id || DEFAULT_VOSK_MODEL_ID;
+  const meta = VOSK_MODELS[id];
+  if (!meta) return { id, installed: false, error: `Unknown model: ${id}` };
+  const filePath = voskModelPath(id);
+  let installed = false;
+  let sizeBytes = 0;
   try {
-    // Prefer the active provider if it can transcribe; otherwise fall back to
-    // any configured provider that can (Gemini or OpenAI).
-    const { provider: active } = getActiveProvider();
-    let provider = active.canTranscribe && providerReady(active) ? active : null;
-    if (!provider) {
-      provider = [getProvider('gemini'), getProvider('openai')]
-        .find(p => p && p.canTranscribe && providerReady(p)) || null;
+    const stat = fs.statSync(filePath);
+    // A partial download (renamed-in but smaller than expected) would be
+    // unusable; treat anything under 1 MB as "not installed" so the user
+    // re-downloads instead of seeing a cryptic Vosk worker error.
+    if (stat.size > 1024 * 1024) {
+      installed = true;
+      sizeBytes = stat.size;
     }
-    if (!provider) {
-      throw new Error('No transcription-capable provider configured (needs Gemini or OpenAI).');
+  } catch (_) { /* file missing */ }
+  return {
+    id,
+    installed,
+    sizeBytes,
+    expectedBytes: meta.expectedBytes,
+    label: meta.label,
+    protocolUrl: installed ? `vosk-model://${id}` : null,
+  };
+});
+
+/**
+ * Stream the model archive from upstream to disk, pushing progress events to
+ * the renderer as it goes. The renderer drives a single progress bar from these.
+ * Uses fetch (Node 18+ global) so we get redirect-following for free.
+ */
+ipcMain.handle('stt:voskModel:download', async (e, payload = {}) => {
+  const id = payload.id || DEFAULT_VOSK_MODEL_ID;
+  const meta = VOSK_MODELS[id];
+  if (!meta) return { ok: false, error: `Unknown model: ${id}` };
+
+  ensureVoskDir();
+  const dest = voskModelPath(id);
+  const tmp = `${dest}.part`;
+  // Wipe any prior aborted download so the partial file doesn't poison this one.
+  try { fs.unlinkSync(tmp); } catch (_) {}
+
+  const send = (phase, downloaded, total) => {
+    if (e.sender && !e.sender.isDestroyed()) {
+      e.sender.send('stt:voskModel:progress', { id, phase, downloaded, total });
     }
-    const text = await provider.transcribe({
-      apiKey: resolveApiKey(provider),
-      audioBase64: audio,
-      language: language || 'en',
+  };
+
+  try {
+    send('starting', 0, meta.expectedBytes);
+    const response = await fetch(meta.url, { redirect: 'follow' });
+    if (!response.ok || !response.body) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    const headerTotal = parseInt(response.headers.get('content-length') || '0', 10);
+    const total = headerTotal > 0 ? headerTotal : meta.expectedBytes;
+
+    const file = fs.createWriteStream(tmp);
+    const reader = response.body.getReader();
+    let downloaded = 0;
+    let lastProgressAt = 0;
+
+    // Backpressure-aware copy: await the write callback so the renderer can't
+    // outrun the disk on slow drives.
+    const writeChunk = (chunk) => new Promise((resolve, reject) => {
+      file.write(chunk, (err) => (err ? reject(err) : resolve()));
     });
-    return { text: text || '' };
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      await writeChunk(value);
+      downloaded += value.length;
+      // Throttle: at most one progress message per ~100ms to keep IPC light.
+      const now = Date.now();
+      if (now - lastProgressAt > 100) {
+        send('downloading', downloaded, total);
+        lastProgressAt = now;
+      }
+    }
+    await new Promise((resolve, reject) => file.end((err) => (err ? reject(err) : resolve())));
+
+    // Atomic swap so a crash mid-download can't leave a half-file at the real path.
+    fs.renameSync(tmp, dest);
+    send('done', downloaded, total);
+    return { ok: true, protocolUrl: `vosk-model://${id}`, sizeBytes: downloaded };
+  } catch (err) {
+    try { fs.unlinkSync(tmp); } catch (_) {}
+    const msg = err?.message || 'Download failed';
+    send('error', 0, meta.expectedBytes);
+    return { ok: false, error: msg };
+  }
+});
+
+/**
+ * Delete a cached model. Surfaced so power-users can free disk; not wired into
+ * the UI yet but available via `window.electronAPI.invoke`.
+ */
+ipcMain.handle('stt:voskModel:remove', (_e, payload = {}) => {
+  const id = payload.id || DEFAULT_VOSK_MODEL_ID;
+  try { fs.unlinkSync(voskModelPath(id)); return { ok: true }; }
+  catch (err) { return { ok: false, error: err.message }; }
+});
+
+// ─── Voice-to-Text (transcription) IPC ────────────────────────────────────────
+//
+// The Voice panel and Voice settings UI go through this namespace exclusively;
+// `ai:transcribe` is kept below as a backwards-compatible shim that resolves
+// the active STT provider the same way and returns the legacy `{ text }` shape.
+
+/**
+ * Resolve the API key for an STT provider:
+ *   1. encrypted secrets store (the canonical source)
+ *   2. shared Gemini key fallback when the user picked Gemini for STT but only
+ *      has the chat-side `gemini` key configured.
+ *   3. .env `VITE_GEMINI_API_KEY` (dev-time convenience, same as chat AI)
+ */
+function resolveSttApiKey(provider) {
+  if (!provider || provider.keyless) return '';
+  if (provider.keyName) {
+    const stored = getSecret(provider.keyName);
+    if (stored) return stored;
+  }
+  if (provider.id === 'gemini') {
+    const envKey = process.env.VITE_GEMINI_API_KEY;
+    if (envKey && envKey !== 'your_api_key_here') return envKey;
+  }
+  return null;
+}
+
+/** Pick the active STT provider object based on persisted settings. */
+function getActiveSttProvider() {
+  const settings = readSettings();
+  const id = settings.sttProvider || DEFAULT_TRANSCRIPTION_PROVIDER_ID;
+  return getTranscriptionProvider(id) || getTranscriptionProvider(DEFAULT_TRANSCRIPTION_PROVIDER_ID);
+}
+
+/** Endpoint override (per-provider) from settings.sttEndpoints. */
+function getSttEndpoint(providerId) {
+  const settings = readSettings();
+  const map = settings.sttEndpoints && typeof settings.sttEndpoints === 'object'
+    ? settings.sttEndpoints
+    : {};
+  const v = map[providerId];
+  return typeof v === 'string' && v.trim() ? v.trim() : '';
+}
+
+/** Catalog + per-provider readiness for the Voice settings UI. */
+ipcMain.handle('transcription:providers', () => {
+  const savedNames = new Set(listSecrets());
+  const savedId = readSettings().sttProvider || DEFAULT_TRANSCRIPTION_PROVIDER_ID;
+  // Stale settings from a previous version can point at a provider that's been
+  // removed. Resolve back to the default so the renderer never lands on a
+  // provider id that isn't in the catalog.
+  const activeId = getTranscriptionProvider(savedId)
+    ? savedId
+    : DEFAULT_TRANSCRIPTION_PROVIDER_ID;
+  const providers = TRANSCRIPTION_PROVIDER_LIST.map((p) => ({
+    ...p,
+    hasKey: p.keyless ? true : (p.keyName ? savedNames.has(p.keyName) : false),
+    endpoint: getSttEndpoint(p.id) || p.defaultEndpoint || '',
+  }));
+  return {
+    providers,
+    activeId,
+    encryptionAvailable: isEncryptionAvailable(),
+  };
+});
+
+/**
+ * Run a transcription with the (optionally overridden) active provider.
+ * `providerId` is accepted so the renderer can transcribe with a specific
+ * provider without persisting it — used by the "Test Connection" probe.
+ */
+ipcMain.handle('transcription:transcribe', async (_e, payload = {}) => {
+  const { audio, mimeType, language, providerId } = payload;
+  if (!audio) {
+    return { ok: false, error: 'No audio data received.', code: 'config' };
+  }
+  const provider = providerId
+    ? (getTranscriptionProvider(providerId) || getActiveSttProvider())
+    : getActiveSttProvider();
+  if (!provider) {
+    return { ok: false, error: 'No transcription provider configured.', code: 'config' };
+  }
+  try {
+    const result = await runTranscription({
+      provider,
+      apiKey: resolveSttApiKey(provider),
+      endpoint: getSttEndpoint(provider.id),
+      audioBase64: audio,
+      mimeType: mimeType || 'audio/webm',
+      language: language ?? null,
+    });
+    return {
+      ok: true,
+      text: result.text,
+      detectedLanguage: result.detectedLanguage,
+      durationMs: result.durationMs,
+      provider: result.provider,
+      providerLabel: provider.label,
+    };
+  } catch (err) {
+    const code = err instanceof TranscriptionError ? err.code : 'unknown';
+    console.warn('[transcription:transcribe]', provider.id, code, err.message);
+    return { ok: false, error: err.message || 'Transcription failed.', code, provider: provider.id };
+  }
+});
+
+/**
+ * Test a provider's credentials + endpoint without performing a real
+ * transcription. The renderer passes the providerId because the user may be
+ * testing a provider they haven't yet activated.
+ */
+ipcMain.handle('transcription:test', async (_e, { providerId } = {}) => {
+  const provider = getTranscriptionProvider(providerId) || getActiveSttProvider();
+  if (!provider) return { ok: false, error: 'Unknown provider.', code: 'config' };
+  try {
+    const out = await testTranscriptionProvider({
+      provider,
+      apiKey: resolveSttApiKey(provider),
+      endpoint: getSttEndpoint(provider.id),
+    });
+    return { ok: true, info: out?.info || 'Connection successful.', provider: provider.id };
+  } catch (err) {
+    const code = err instanceof TranscriptionError ? err.code : 'unknown';
+    return { ok: false, error: err.message || 'Connection failed.', code, provider: provider.id };
+  }
+});
+
+/**
+ * Backwards-compatible shim. The old `ai:transcribe` channel used Gemini /
+ * OpenAI directly from `electron-ai-providers.js`; we now route it through the
+ * STT executor so anything that still calls it (or third-party plugins) keeps
+ * working but benefits from provider switching and auto-detect.
+ */
+ipcMain.handle('ai:transcribe', async (_e, { audio, language } = {}) => {
+  if (!audio) throw new Error('Transcription failed: no audio');
+  const provider = getActiveSttProvider();
+  if (!provider) throw new Error('Transcription failed: no provider configured');
+  try {
+    const result = await runTranscription({
+      provider,
+      apiKey: resolveSttApiKey(provider),
+      endpoint: getSttEndpoint(provider.id),
+      audioBase64: audio,
+      mimeType: 'audio/webm',
+      language: language || null,
+    });
+    return { text: result.text || '' };
   } catch (err) {
     console.error('[AI:Transcribe] Error:', err.message);
     throw new Error('Transcription failed: ' + (err.message || 'Unknown error'));
@@ -2111,6 +2394,13 @@ ipcMain.handle('updater:install', () => {
 
 ipcMain.handle('app:getVersion', () => app.getVersion());
 
+app.on('web-contents-created', (event, contents) => {
+  contents.setWindowOpenHandler(({ url }) => {
+    shell.openExternal(url);
+    return { action: 'deny' };
+  });
+});
+
 // Renderer is mounted and listening for `shell:openPanel` / `notify`. If we
 // were launched from the Explorer context menu (pendingShellIntent set at
 // startup), act on it now that the renderer can receive the dispatch.
@@ -2259,6 +2549,31 @@ function sendToRenderer(channel, payload) {
 
 app.on('ready', () => {
   const settings = readSettings();
+
+  // Serve cached Vosk model files to the renderer via a custom protocol so
+  // `vosk-browser`'s fetch can load them with no special CORS dance and no
+  // ad-hoc local HTTP server. The path component (or hostname) selects which
+  // model — only one shipped today, but the shape supports more.
+  protocol.handle('vosk-model', async (request) => {
+    try {
+      const url = new URL(request.url);
+      const id = (url.hostname || url.pathname.replace(/^\//, '').split('/')[0] || '').trim();
+      const meta = VOSK_MODELS[id];
+      if (!meta) return new Response('Unknown model', { status: 404 });
+      const filePath = voskModelPath(id);
+      const buffer = await fs.promises.readFile(filePath);
+      return new Response(buffer, {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/gzip',
+          'Content-Length': String(buffer.length),
+          'Cache-Control': 'no-store',
+        },
+      });
+    } catch (err) {
+      return new Response(`Model load failed: ${err.message}`, { status: 500 });
+    }
+  });
 
   // Auto-updater and heartbeat are dock-independent — start them either way so
   // a user who's stuck on the welcome screen still gets background updates.

@@ -2,7 +2,23 @@
   "permissions": {
     "allow": [
       "Bash(ls *)",
-      "WebSearch"
+      "WebSearch",
+      "WebFetch(domain:share.google)",
+      "WebFetch(domain:www.google.com)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:devblogs.microsoft.com)",
+      "Bash(npm run *)",
+      "Bash(node --check electron-main.js)",
+      "Bash(node --check electron-ai-providers.js)",
+      "Bash(node --check electron-transcription-providers.js)",
+      "WebFetch(domain:www.npmjs.com)",
+      "Bash(npm install *)",
+      "Bash(git check-ignore *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git push *)",
+      "Bash(git fetch *)",
+      "Bash(git merge *)"
     ]
   }
 }
