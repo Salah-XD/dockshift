@@ -168,6 +168,100 @@ const voskOffline = {
 };
 
 /**
+ * On-device, high-accuracy speech via sherpa-onnx running in the MAIN process.
+ *
+ * These are the `localNative` tier: unlike Vosk (`clientSide`, runs in the
+ * renderer) they receive **Float32 PCM** (base64) from the renderer and decode
+ * it through `electron-sherpa-engine.js`. The model is resolved + checked via
+ * the catalog in `electron-stt-models.js`. No API key, no audio leaves the device.
+ *
+ * The factory exists because Parakeet and Whisper providers are identical except
+ * for their backing model id; keeping the contract in one place avoids drift.
+ */
+function makeLocalNativeProvider({ id, label, modelId, description, setupHint, timestamps }) {
+  return {
+    id,
+    label,
+    keyName: null,
+    keyless: true,
+    localNative: true,        // PCM in, decoded by sherpa in the main process
+    modelId,                  // which entry in the electron-stt-models catalog
+    description,
+    setupHint,
+    docsUrl: null,
+    defaultEndpoint: '',
+    supportsCustomEndpoint: false,
+    supportedAudioMimes: [],  // unused — renderer sends raw Float32 PCM, not a container
+    languageHintFormat: 'iso-639-1',
+    capabilities: {
+      autoDetectLanguage: true,
+      streaming: false,
+      multilingual: true,
+      timestamps: !!timestamps,
+      diarization: false,
+    },
+
+    async transcribe({ audioBase64, sampleRate, language, signal }) {
+      const models = await import('./electron-stt-models.js');
+      const engine = await import('./electron-sherpa-engine.js');
+      const meta = models.getModel(this.modelId);
+      if (!meta) throw new TranscriptionError(`Unknown on-device model: ${this.modelId}`, 'config');
+      if (!models.isInstalled(this.modelId)) {
+        throw new TranscriptionError(
+          `${this.label}: the on-device model isn't downloaded yet — install it in Settings → Voice to Text.`,
+          'config',
+        );
+      }
+      if (!sampleRate) {
+        throw new TranscriptionError(`${this.label}: missing sampleRate for on-device PCM.`, 'config');
+      }
+      const out = await engine.transcribePcm({
+        modelId: this.modelId,
+        modelDir: models.getModelDir(this.modelId),
+        modelType: meta.modelType,
+        pcmFloat32Base64: audioBase64,
+        sampleRate,
+        language,
+      });
+      void signal; // decode is synchronous-ish + fast; the executor timeout still applies
+      return {
+        text: out.text,
+        detectedLanguage: out.language || null,
+        durationMs: out.audioMs ?? null,
+        raw: out.raw,
+      };
+    },
+
+    async testConnection() {
+      const models = await import('./electron-stt-models.js');
+      const installed = models.isInstalled(this.modelId);
+      return {
+        ok: true,
+        info: installed ? 'On-device — model installed and ready.' : 'On-device — model downloads on first use.',
+      };
+    },
+  };
+}
+
+const localParakeet = makeLocalNativeProvider({
+  id: 'local-parakeet',
+  label: 'On-device — Parakeet (offline)',
+  modelId: 'parakeet-v3',
+  description: 'Runs fully on your computer. No internet, no API key, no audio uploaded. 25 European languages.',
+  setupHint: 'A one-time ~620 MB model download. After that, voice works offline.',
+  timestamps: true,
+});
+
+const localWhisper = makeLocalNativeProvider({
+  id: 'local-whisper',
+  label: 'On-device — Whisper (offline, multilingual)',
+  modelId: 'whisper-medium',
+  description: 'On-device Whisper for languages Parakeet can\'t do (Hindi, Chinese, Japanese, Arabic, …).',
+  setupHint: 'A one-time multi-hundred-MB model download. After that, voice works offline.',
+  timestamps: false,
+});
+
+/**
  * OpenAI Whisper — the most widely used managed transcription API.
  * Endpoint is OpenAI-compatible, which is why Groq and many local stacks
  * (e.g. `whisper.cpp` server, `faster-whisper-server`) use the same shape;
@@ -797,6 +891,8 @@ const customCompat = {
 /* ─── Registry ──────────────────────────────────────────────────────────── */
 
 export const TRANSCRIPTION_PROVIDERS = {
+  [localParakeet.id]: localParakeet,
+  [localWhisper.id]: localWhisper,
   [voskOffline.id]: voskOffline,
   [openaiWhisper.id]: openaiWhisper,
   [groqWhisper.id]: groqWhisper,
@@ -809,9 +905,13 @@ export const TRANSCRIPTION_PROVIDERS = {
 };
 
 /**
- * Default provider id when settings.sttProvider is unset. On-device speech is
- * the only option that works with no setup and no API key, so new installs
- * land there. The renderer prompts for the one-time model download.
+ * Default provider id when settings.sttProvider is unset.
+ *
+ * NOTE: this stays `vosk-offline` until the renderer learns the `localNative`
+ * PCM path (Phase 1 renderer wiring — `useMicPcm` + VoicePanel). Flipping the
+ * default to `local-parakeet` before then would route new installs down a path
+ * the Voice panel can't yet drive. Flip to `localParakeet.id` once the renderer
+ * sends `{ pcm: true, sampleRate }`.
  */
 export const DEFAULT_TRANSCRIPTION_PROVIDER_ID = voskOffline.id;
 
@@ -826,6 +926,11 @@ export const TRANSCRIPTION_PROVIDER_LIST = Object.values(TRANSCRIPTION_PROVIDERS
   // and posting it to main. Any provider without this stays on the
   // MediaRecorder → IPC → main path.
   clientSide: !!p.clientSide,
+  // `localNative: true` providers decode in the main process and need the
+  // renderer to capture raw Float32 PCM (via useMicPcm) and post it with
+  // `{ pcm: true, sampleRate }`. `modelId` ties the provider to a catalog model.
+  localNative: !!p.localNative,
+  modelId: p.modelId || null,
   description: p.description,
   setupHint: p.setupHint || null,
   docsUrl: p.docsUrl || null,
@@ -880,12 +985,13 @@ function normalizeThrown(err, providerLabel) {
  * @param {object} args.provider              provider object
  * @param {string|null} args.apiKey           resolved API key (or null/'' for keyless)
  * @param {string} [args.endpoint]            user-configured custom endpoint
- * @param {string} args.audioBase64
+ * @param {string} args.audioBase64           container bytes (cloud) OR raw Float32 PCM (localNative)
  * @param {string} args.mimeType
+ * @param {number} [args.sampleRate]           required for localNative (PCM) providers; ignored by cloud
  * @param {string|null} args.language         BCP-47 / ISO-639-1 / 'auto' / null
  * @returns {Promise<{text, detectedLanguage, durationMs, provider, raw}>}
  */
-export async function runTranscription({ provider, apiKey, endpoint, audioBase64, mimeType, language }) {
+export async function runTranscription({ provider, apiKey, endpoint, audioBase64, mimeType, sampleRate, language }) {
   if (!provider) throw new TranscriptionError('No transcription provider selected.', 'config');
   if (!provider.keyless && !apiKey) {
     throw new TranscriptionError(`${provider.label}: no API key configured — add one in Settings → Voice to Text.`, 'auth');
@@ -899,7 +1005,7 @@ export async function runTranscription({ provider, apiKey, endpoint, audioBase64
   }
   try {
     const result = await withTimeout(TRANSCRIBE_TIMEOUT_MS, provider.label, (signal) =>
-      provider.transcribe({ apiKey, endpoint, audioBase64, mimeType, language, signal })
+      provider.transcribe({ apiKey, endpoint, audioBase64, mimeType, sampleRate, language, signal })
     );
     return {
       text: result?.text || '',
