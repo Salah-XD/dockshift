@@ -12,7 +12,12 @@ import {
 const TERMS_URL = 'https://dock-shift.vercel.app/terms';
 const PRIVACY_URL = 'https://dock-shift.vercel.app/privacy';
 
-const STEPS = ['intro', 'features', 'hotkey', 'confirm'];
+const STEPS = ['intro', 'features', 'voice', 'hotkey', 'confirm'];
+
+/** Map an on-device model id to the transcription provider that backs it. */
+function providerForModel(modelId) {
+  return modelId && modelId.startsWith('whisper') ? 'local-whisper' : 'local-parakeet';
+}
 
 // Standalone first-run window. Renders inside its own BrowserWindow (created by
 // the main process with frame + taskbar entry), so unlike the old WelcomeModal
@@ -24,7 +29,23 @@ export default function WelcomeWindow() {
   const [analyticsEnabled, setAnalyticsEnabled] = useState(true);
   const [agreed, setAgreed] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const [voiceModels, setVoiceModels] = useState([]);
+  const [voiceModelId, setVoiceModelId] = useState('parakeet-v3');
   const api = window.electronAPI;
+
+  // Load the on-device voice model catalog for the comparison step. Default the
+  // selection to the recommended (installable) model the catalog flags.
+  useEffect(() => {
+    let cancelled = false;
+    api?.invoke?.('stt:models:list').then((res) => {
+      if (cancelled || !res?.models) return;
+      setVoiceModels(res.models);
+      const rec = res.models.find((m) => m.isDefault && m.installable)
+        || res.models.find((m) => m.installable);
+      if (rec) setVoiceModelId(rec.id);
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [api]);
 
   const next = useCallback(() => setStep((s) => Math.min(s + 1, STEPS.length - 1)), []);
   const back = useCallback(() => setStep((s) => Math.max(s - 1, 0)), []);
@@ -38,14 +59,18 @@ export default function WelcomeWindow() {
     if (!agreed || submitting) return;
     setSubmitting(true);
     try {
-      await api?.invoke?.('welcome:complete', { analyticsEnabled });
+      await api?.invoke?.('welcome:complete', {
+        analyticsEnabled,
+        voiceProvider: providerForModel(voiceModelId),
+        voiceModel: voiceModelId,
+      });
       // Main process closes this window once the dock is up; if for some
       // reason it didn't, fall back to closing here so the user isn't stuck.
       setTimeout(() => window.close?.(), 600);
     } catch (e) {
       setSubmitting(false);
     }
-  }, [agreed, submitting, analyticsEnabled, api]);
+  }, [agreed, submitting, analyticsEnabled, api, voiceModelId]);
 
   // Enter advances through the tour and submits on the confirm step (when
   // agreed). Keeps the keyboard-only path workable.
@@ -87,8 +112,11 @@ export default function WelcomeWindow() {
       >
         {step === 0 && <StepIntro />}
         {step === 1 && <StepFeatures />}
-        {step === 2 && <StepHotkey />}
-        {step === 3 && (
+        {step === 2 && (
+          <StepVoice models={voiceModels} selected={voiceModelId} onSelect={setVoiceModelId} />
+        )}
+        {step === 3 && <StepHotkey />}
+        {step === 4 && (
           <StepConfirm
             analyticsEnabled={analyticsEnabled}
             setAnalyticsEnabled={setAnalyticsEnabled}
@@ -365,6 +393,122 @@ function StepFeatures() {
             </div>
           </div>
         ))}
+      </div>
+    </div>
+  );
+}
+
+const VOICE_NAMES = {
+  'parakeet-v3': 'Parakeet v3',
+  'parakeet-v2': 'Parakeet v2',
+  'whisper-small': 'Whisper small',
+  'whisper-medium': 'Whisper medium',
+};
+function shortModelName(m) { return VOICE_NAMES[m.id] || m.label; }
+function formatMB(bytes) {
+  if (!bytes) return '';
+  const mb = bytes / 1024 / 1024;
+  return mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${Math.round(mb)} MB`;
+}
+
+function Pill({ children, tone }) {
+  const tones = {
+    accent: ['rgba(108,140,255,0.18)', '#9fb4ff'],
+    success: ['rgba(95,207,142,0.15)', '#5fcf8e'],
+    muted: ['rgba(138,144,160,0.12)', '#8a90a0'],
+    neutral: ['rgba(138,144,160,0.10)', '#8a90a0'],
+  };
+  const [bg, fg] = tones[tone] || tones.neutral;
+  return (
+    <span style={{
+      fontSize: 9.5, fontWeight: 700, padding: '2px 6px', borderRadius: 999,
+      background: bg, color: fg, textTransform: 'uppercase', letterSpacing: 0.4, whiteSpace: 'nowrap',
+    }}>
+      {children}
+    </span>
+  );
+}
+
+function MetricBar({ label, value, max = 5, color }) {
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+      <span style={{ fontSize: 10, color: 'var(--ds-text-faint, #6b6f7c)', width: 52, textAlign: 'right' }}>{label}</span>
+      <div style={{ display: 'flex', gap: 3 }}>
+        {Array.from({ length: max }).map((_, i) => (
+          <span key={i} style={{
+            width: 14, height: 6, borderRadius: 2,
+            background: i < value ? (color || 'var(--ds-accent, #6c8cff)') : 'var(--ds-border-strong, #2a2f3d)',
+          }} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function StepVoice({ models, selected, onSelect }) {
+  const list = Array.isArray(models) ? models : [];
+  return (
+    <div style={{ width: '100%', maxWidth: 580 }}>
+      <h2 style={{
+        margin: '0 0 4px', fontSize: 20, fontWeight: 600, textAlign: 'center',
+        color: 'var(--ds-text-strong, #fff)',
+      }}>
+        Your voice engine
+      </h2>
+      <p style={{
+        margin: '0 0 16px', fontSize: 12.5, lineHeight: 1.45, textAlign: 'center',
+        color: 'var(--ds-text-muted, #8a90a0)',
+      }}>
+        Speech-to-text runs fully on your device — offline, no API key, nothing uploaded.
+        We download it for you. Change it any time in Settings.
+      </p>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8, maxHeight: 296, overflowY: 'auto' }}>
+        {list.length === 0 && (
+          <div style={{ textAlign: 'center', fontSize: 12.5, color: 'var(--ds-text-faint, #6b6f7c)' }}>
+            Loading models…
+          </div>
+        )}
+        {list.map((m) => {
+          const isSel = m.id === selected;
+          const disabled = !m.installable;
+          return (
+            <button
+              key={m.id}
+              disabled={disabled}
+              onClick={() => !disabled && onSelect(m.id)}
+              style={{
+                textAlign: 'left', display: 'flex', alignItems: 'center', gap: 12,
+                padding: '10px 12px', borderRadius: 'var(--ds-radius-md, 10px)', width: '100%',
+                background: isSel ? 'var(--ds-accent-bg, rgba(108,140,255,0.12))' : 'var(--ds-bg-subtle, #161922)',
+                border: `1px solid ${isSel ? 'var(--ds-accent, #6c8cff)' : 'var(--ds-border-subtle, #1f2330)'}`,
+                cursor: disabled ? 'default' : 'pointer', opacity: disabled ? 0.55 : 1, fontFamily: 'inherit',
+              }}
+            >
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 7, flexWrap: 'wrap' }}>
+                  <span style={{ fontSize: 13.5, fontWeight: 600, color: 'var(--ds-text-strong, #fff)' }}>
+                    {shortModelName(m)}
+                  </span>
+                  {m.isDefault && m.installable && <Pill tone="accent">Recommended</Pill>}
+                  {!m.installable && <Pill tone="muted">Soon</Pill>}
+                  <Pill tone={m.multilingual ? 'success' : 'neutral'}>
+                    {m.multilingual ? 'Multilingual' : 'English'}
+                  </Pill>
+                </div>
+                <div style={{ fontSize: 11, color: 'var(--ds-text-muted, #8a90a0)', marginTop: 3 }}>
+                  {formatMB(m.downloadBytes)} download
+                  {m.languages
+                    ? ` · ${m.languages.length === 1 ? 'English only' : `${m.languages.length} languages`}`
+                    : ' · 99 languages'}
+                </div>
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 5, flexShrink: 0 }}>
+                <MetricBar label="Accuracy" value={m.accuracy || 0} color="var(--ds-accent-light, #9fb4ff)" />
+                <MetricBar label="Speed" value={m.speed || 0} color="#5fcf8e" />
+              </div>
+            </button>
+          );
+        })}
       </div>
     </div>
   );

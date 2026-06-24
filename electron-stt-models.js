@@ -43,6 +43,9 @@ export const MODEL_CATALOG = {
     languages: ['en', 'bg', 'hr', 'cs', 'da', 'nl', 'et', 'fi', 'fr', 'de', 'el',
       'hu', 'it', 'lv', 'lt', 'mt', 'pl', 'pt', 'ro', 'sk', 'sl', 'es', 'sv', 'ru', 'uk'],
     default: true,
+    // 1–5 qualitative ratings shown on the welcome comparison cards.
+    accuracy: 4,
+    speed: 5,
     timestamps: true, // sherpa returns token-level timestamps for this model
   },
   'parakeet-v2': {
@@ -51,34 +54,40 @@ export const MODEL_CATALOG = {
     modelType: 'nemo_transducer',
     archive: 'sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8.tar.bz2',
     url: `${ASR_MODEL_BASE}/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8.tar.bz2`,
-    sha256: null, // TODO: pin checksum before enabling install
-    downloadBytes: 487 * 1024 * 1024,
+    sha256: '157c157bc51155e03e37d2466522a3a737dd9c72bb25f36eb18912964161e1ad',
+    downloadBytes: 482468385,
     installBytes: 645 * 1024 * 1024,
     languages: ['en'],
+    accuracy: 5,
+    speed: 5,
     timestamps: true,
   },
   'whisper-medium': {
     id: 'whisper-medium',
     label: 'Whisper medium (offline, 99 languages incl. Hindi/CJK/Arabic)',
     modelType: 'whisper',
-    archive: 'sherpa-onnx-whisper-medium.int8.tar.bz2',
-    url: `${ASR_MODEL_BASE}/sherpa-onnx-whisper-medium.int8.tar.bz2`,
-    sha256: null, // TODO: pin checksum before enabling install
-    downloadBytes: 800 * 1024 * 1024,
-    installBytes: 1500 * 1024 * 1024,
+    archive: 'sherpa-onnx-whisper-medium.tar.bz2',
+    url: `${ASR_MODEL_BASE}/sherpa-onnx-whisper-medium.tar.bz2`,
+    sha256: null, // TODO: pin checksum + verify whisper engine path before enabling install
+    downloadBytes: 1842 * 1024 * 1024,
+    installBytes: 3000 * 1024 * 1024,
     languages: null, // multilingual — the non-European fallback
+    accuracy: 5,
+    speed: 2,
     timestamps: false,
   },
   'whisper-small': {
     id: 'whisper-small',
     label: 'Whisper small (offline, 99 languages, lighter)',
     modelType: 'whisper',
-    archive: 'sherpa-onnx-whisper-small.int8.tar.bz2',
-    url: `${ASR_MODEL_BASE}/sherpa-onnx-whisper-small.int8.tar.bz2`,
-    sha256: null, // TODO: pin checksum before enabling install
-    downloadBytes: 460 * 1024 * 1024,
-    installBytes: 970 * 1024 * 1024,
+    archive: 'sherpa-onnx-whisper-small.tar.bz2',
+    url: `${ASR_MODEL_BASE}/sherpa-onnx-whisper-small.tar.bz2`,
+    sha256: null, // TODO: pin checksum + verify whisper engine path before enabling install
+    downloadBytes: 610 * 1024 * 1024,
+    installBytes: 1100 * 1024 * 1024,
     languages: null,
+    accuracy: 4,
+    speed: 3,
     timestamps: false,
   },
 };
@@ -156,6 +165,13 @@ function dirSizeBytes(dir) {
   return total;
 }
 
+/** A model is "multilingual" if it has no language restriction or more than one. */
+export function isMultilingual(id) {
+  const m = getModel(id);
+  if (!m) return false;
+  return m.languages === null || (Array.isArray(m.languages) && m.languages.length > 1);
+}
+
 export function getStatus(id, opts = {}) {
   const m = getModel(id);
   if (!m) return { id, installed: false, error: `Unknown model: ${id}` };
@@ -165,8 +181,12 @@ export function getStatus(id, opts = {}) {
     label: m.label,
     modelType: m.modelType,
     languages: m.languages,
+    multilingual: isMultilingual(id),
+    accuracy: m.accuracy ?? null,
+    speed: m.speed ?? null,
     installable: !!m.sha256,
     installed,
+    downloading: isDownloading(id),
     downloadBytes: m.downloadBytes,
     installBytes: m.installBytes,
     sizeOnDisk: installed ? dirSizeBytes(getModelDir(id, opts)) : 0,
@@ -287,10 +307,17 @@ export async function installFromArchive(id, archivePath, { onProgress, ...opts 
  * @param {AbortSignal} [args.signal]
  * @param {string} [args.modelsDir]   override base dir (testing)
  */
+/** Models with a download currently in flight (dedupes welcome + panel triggers). */
+const _downloading = new Set();
+export function isDownloading(id) { return _downloading.has(id); }
+
 export async function downloadModel(id, { onProgress, signal, ...opts } = {}) {
   const m = getModel(id);
   if (!m) return { ok: false, error: `Unknown model: ${id}` };
   if (!m.sha256) return { ok: false, error: `${m.label}: checksum not pinned yet — install disabled.` };
+  if (_downloading.has(id)) return { ok: true, id, inFlight: true };
+  if (isInstalled(id, opts)) return { ok: true, id, dir: getModelDir(id, opts), alreadyInstalled: true };
+  _downloading.add(id);
 
   const dir = getModelsDir(opts);
   fs.mkdirSync(dir, { recursive: true });
@@ -345,6 +372,8 @@ export async function downloadModel(id, { onProgress, signal, ...opts } = {}) {
     const msg = err?.name === 'AbortError' ? 'cancelled' : (err?.message || 'download failed');
     emit('error', 0, m.downloadBytes);
     return { ok: false, error: msg };
+  } finally {
+    _downloading.delete(id);
   }
 }
 

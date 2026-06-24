@@ -1341,6 +1341,16 @@ ipcMain.handle('stt:voskModel:remove', (_e, payload = {}) => {
 // before extraction. All logic lives in electron-stt-models.js; these handlers
 // are thin adapters that forward download progress over `stt:model:progress`.
 
+// Push model-download progress to every renderer (the welcome window starts a
+// background download then closes, so the dock window must also receive it).
+function broadcastSttModelProgress(p) {
+  for (const w of BrowserWindow.getAllWindows()) {
+    if (!w.isDestroyed()) {
+      try { w.webContents.send('stt:model:progress', p); } catch (_) { /* window gone */ }
+    }
+  }
+}
+
 ipcMain.handle('stt:models:list', () => {
   try { return { ok: true, models: sttModels.listModels() }; }
   catch (err) { return { ok: false, error: err.message, models: [] }; }
@@ -1416,6 +1426,20 @@ function getSttEndpoint(providerId) {
   return typeof v === 'string' && v.trim() ? v.trim() : '';
 }
 
+/**
+ * Resolve the active model id for a localNative provider from settings.sttModel,
+ * but only when the chosen model is the same engine family as the provider's
+ * default (e.g. Parakeet v2 ↔ v3). Returns undefined to mean "use the default".
+ */
+function resolveActiveModelId(provider) {
+  if (!provider?.localNative) return undefined;
+  const sel = readSettings().sttModel;
+  if (!sel) return undefined;
+  const selM = sttModels.getModel(sel);
+  const defM = sttModels.getModel(provider.modelId);
+  return (selM && defM && selM.modelType === defM.modelType) ? sel : undefined;
+}
+
 /** Catalog + per-provider readiness for the Voice settings UI. */
 ipcMain.handle('transcription:providers', () => {
   const savedNames = new Set(listSecrets());
@@ -1464,6 +1488,7 @@ ipcMain.handle('transcription:transcribe', async (_e, payload = {}) => {
       // localNative providers receive raw Float32 PCM + its capture rate; cloud
       // providers ignore sampleRate and use the container's mimeType.
       sampleRate: typeof sampleRate === 'number' ? sampleRate : undefined,
+      modelId: resolveActiveModelId(provider),
       language: language ?? null,
     });
     return {
@@ -1707,6 +1732,7 @@ const SETTINGS_SCHEMA = {
   aiProvider: (v) => (typeof v === 'string' && v.length <= 32 ? v : undefined),
   aiModel: (v) => (typeof v === 'string' && v.length <= 128 ? v : undefined),
   sttProvider: (v) => (typeof v === 'string' && v.length <= 32 ? v : undefined),
+  sttModel: (v) => (typeof v === 'string' && v.length <= 48 ? v : undefined),
   sttLanguage: (v) => (typeof v === 'string' && v.length <= 16 ? v : undefined),
   sttEndpoints: (v) => {
     if (!v || typeof v !== 'object' || Array.isArray(v)) return undefined;
@@ -1772,6 +1798,13 @@ ipcMain.handle('welcome:complete', (_e, payload = {}) => {
     launchOnStartup: true,
     analyticsEnabled: !!payload.analyticsEnabled,
   };
+  // Voice engine chosen on the welcome screen (falls back to the defaults).
+  if (typeof payload.voiceProvider === 'string' && getTranscriptionProvider(payload.voiceProvider)) {
+    next.sttProvider = payload.voiceProvider;
+  }
+  if (typeof payload.voiceModel === 'string' && sttModels.getModel(payload.voiceModel)) {
+    next.sttModel = payload.voiceModel;
+  }
   writeJsonAtomic(settingsFile(), next);
   applySettings(next);
 
@@ -1780,6 +1813,17 @@ ipcMain.handle('welcome:complete', (_e, payload = {}) => {
   if (welcomeWindow && !welcomeWindow.isDestroyed()) {
     welcomeWindow.close();
   }
+
+  // Auto-download the chosen on-device model in the background so it's ready by
+  // the time the user opens the Voice panel. Progress is broadcast to the dock.
+  const modelToGet = (typeof payload.voiceModel === 'string' && payload.voiceModel)
+    ? payload.voiceModel
+    : sttModels.DEFAULT_MODEL_ID;
+  if (sttModels.getModel(modelToGet)?.sha256 && !sttModels.isInstalled(modelToGet)) {
+    sttModels.downloadModel(modelToGet, { onProgress: broadcastSttModelProgress })
+      .catch((err) => console.warn('[welcome] model auto-download failed:', err?.message));
+  }
+
   return { ok: true };
 });
 

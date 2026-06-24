@@ -201,12 +201,20 @@ function makeLocalNativeProvider({ id, label, modelId, description, setupHint, t
       diarization: false,
     },
 
-    async transcribe({ audioBase64, sampleRate, language, signal }) {
+    async transcribe({ audioBase64, sampleRate, language, modelId, signal }) {
       const models = await import('./electron-stt-models.js');
       const engine = await import('./electron-sherpa-engine.js');
-      const meta = models.getModel(this.modelId);
-      if (!meta) throw new TranscriptionError(`Unknown on-device model: ${this.modelId}`, 'config');
-      if (!models.isInstalled(this.modelId)) {
+      const defMeta = models.getModel(this.modelId);
+      // Honor a per-provider model override (settings.sttModel) — but only when
+      // it's the same engine family as this provider's default, so the provider
+      // stays generic and can't be pointed at an incompatible model.
+      const overrideMeta = modelId ? models.getModel(modelId) : null;
+      const useId = (overrideMeta && defMeta && overrideMeta.modelType === defMeta.modelType)
+        ? modelId
+        : this.modelId;
+      const meta = models.getModel(useId);
+      if (!meta) throw new TranscriptionError(`Unknown on-device model: ${useId}`, 'config');
+      if (!models.isInstalled(useId)) {
         throw new TranscriptionError(
           `${this.label}: the on-device model isn't downloaded yet — install it in Settings → Voice to Text.`,
           'config',
@@ -216,8 +224,8 @@ function makeLocalNativeProvider({ id, label, modelId, description, setupHint, t
         throw new TranscriptionError(`${this.label}: missing sampleRate for on-device PCM.`, 'config');
       }
       const out = await engine.transcribePcm({
-        modelId: this.modelId,
-        modelDir: models.getModelDir(this.modelId),
+        modelId: useId,
+        modelDir: models.getModelDir(useId),
         modelType: meta.modelType,
         pcmFloat32Base64: audioBase64,
         sampleRate,
@@ -907,13 +915,11 @@ export const TRANSCRIPTION_PROVIDERS = {
 /**
  * Default provider id when settings.sttProvider is unset.
  *
- * NOTE: this stays `vosk-offline` until the renderer learns the `localNative`
- * PCM path (Phase 1 renderer wiring — `useMicPcm` + VoicePanel). Flipping the
- * default to `local-parakeet` before then would route new installs down a path
- * the Voice panel can't yet drive. Flip to `localParakeet.id` once the renderer
- * sends `{ pcm: true, sampleRate }`.
+ * On-device Parakeet is the default for every install: fully offline, no API
+ * key, high accuracy. The renderer (Voice panel / welcome) prompts for + drives
+ * the one-time model download via the `stt:model:*` IPC + `useMicPcm` PCM path.
  */
-export const DEFAULT_TRANSCRIPTION_PROVIDER_ID = voskOffline.id;
+export const DEFAULT_TRANSCRIPTION_PROVIDER_ID = localParakeet.id;
 
 /** Catalog shape sent to the renderer — never includes runtime functions. */
 export const TRANSCRIPTION_PROVIDER_LIST = Object.values(TRANSCRIPTION_PROVIDERS).map((p) => ({
@@ -991,7 +997,7 @@ function normalizeThrown(err, providerLabel) {
  * @param {string|null} args.language         BCP-47 / ISO-639-1 / 'auto' / null
  * @returns {Promise<{text, detectedLanguage, durationMs, provider, raw}>}
  */
-export async function runTranscription({ provider, apiKey, endpoint, audioBase64, mimeType, sampleRate, language }) {
+export async function runTranscription({ provider, apiKey, endpoint, audioBase64, mimeType, sampleRate, language, modelId }) {
   if (!provider) throw new TranscriptionError('No transcription provider selected.', 'config');
   if (!provider.keyless && !apiKey) {
     throw new TranscriptionError(`${provider.label}: no API key configured — add one in Settings → Voice to Text.`, 'auth');
@@ -1005,7 +1011,7 @@ export async function runTranscription({ provider, apiKey, endpoint, audioBase64
   }
   try {
     const result = await withTimeout(TRANSCRIBE_TIMEOUT_MS, provider.label, (signal) =>
-      provider.transcribe({ apiKey, endpoint, audioBase64, mimeType, sampleRate, language, signal })
+      provider.transcribe({ apiKey, endpoint, audioBase64, mimeType, sampleRate, language, modelId, signal })
     );
     return {
       text: result?.text || '',

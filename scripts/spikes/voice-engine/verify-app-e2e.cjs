@@ -44,13 +44,13 @@ function parseWavToPcm(file) {
 }
 
 function seedUserData() {
-  fs.rmSync(TEST_UD, { recursive: true, force: true });
+  // TEST_UD is a fresh unique dir; junction the model in (no 640 MB copy). We do
+  // NOT recursive-rm here so a stray junction can't be followed into its target.
   fs.mkdirSync(path.join(TEST_UD, 'sttModels'), { recursive: true });
   // Skip the welcome window + default to the on-device provider.
   fs.writeFileSync(path.join(TEST_UD, 'settings.json'), JSON.stringify({ hasCompletedWelcome: true, sttProvider: 'local-parakeet' }, null, 2));
-  // Copy the extracted model into place + write the ready marker the catalog expects.
   const dest = path.join(TEST_UD, 'sttModels', MODEL_ID);
-  fs.cpSync(MODEL_SRC, dest, { recursive: true });
+  if (!fs.existsSync(dest)) fs.symlinkSync(path.resolve(MODEL_SRC), dest, 'junction');
   fs.writeFileSync(path.join(dest, '.ready.json'), JSON.stringify({ id: MODEL_ID, modelType: 'nemo_transducer', installedAt: new Date().toISOString() }));
 }
 

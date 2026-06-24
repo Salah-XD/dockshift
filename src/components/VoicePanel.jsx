@@ -127,6 +127,7 @@ export default function VoicePanel({ isOpen, onClose, anchorRect }) {
   const [localModelInstalled, setLocalModelInstalled] = useState(false);
   const [localModelStatus, setLocalModelStatus] = useState(null); // catalog getStatus()
   const [localDownloadState, setLocalDownloadState] = useState(null);
+  const autoDlRef = useRef(false); // ensures the auto-download fires at most once
 
   // Catalog + persisted language preference. Reload on every panel open so
   // changes made in Settings (provider switch, key added) take effect without
@@ -253,14 +254,28 @@ export default function VoicePanel({ isOpen, onClose, anchorRect }) {
     return () => { try { unsub?.(); } catch (_) {} };
   }, [api]);
 
-  // localNative model: check whether the provider's model is on disk yet.
+  // localNative model: check whether the provider's model is on disk yet, and
+  // auto-download it for every user if it's missing (no manual click needed).
   useEffect(() => {
     if (!isOpen || !api || !isLocalNative || !localModelId) return undefined;
     let cancelled = false;
     api.invoke('stt:model:status', { id: localModelId }).then((res) => {
-      if (cancelled) return;
-      setLocalModelStatus(res || null);
-      setLocalModelInstalled(!!res?.installed);
+      if (cancelled || !res) return;
+      setLocalModelStatus(res);
+      setLocalModelInstalled(!!res.installed);
+      if (res.downloading) {
+        // A background download (e.g. kicked off from the welcome screen) is
+        // already running — reflect it instead of starting a second one.
+        setLocalDownloadState((s) => s || { phase: 'downloading', downloaded: 0, total: res.downloadBytes || 0 });
+      } else if (res.installable && !res.installed && !autoDlRef.current) {
+        autoDlRef.current = true;
+        setLocalDownloadState({ phase: 'starting', downloaded: 0, total: res.downloadBytes || 0 });
+        api.invoke('stt:model:download', { id: localModelId }).then((r) => {
+          if (cancelled) return;
+          if (r && !r.ok) setLocalDownloadState({ phase: 'error', downloaded: 0, total: 0 });
+          else setLocalModelInstalled(true);
+        }).catch(() => {});
+      }
     }).catch(() => {});
     return () => { cancelled = true; };
   }, [isOpen, api, isLocalNative, localModelId]);
