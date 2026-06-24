@@ -78,6 +78,7 @@
       "electron-ai-providers.js",
       "electron-transcription-providers.js",
       "electron-sherpa-engine.js",
+      "electron-stt-models.js",
       "electron-persistence.js",
       "electron-secrets.js",
       "electron-shell-integration.js",
