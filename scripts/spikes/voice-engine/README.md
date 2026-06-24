@@ -1,0 +1,47 @@
+# Phase 0 spike — local voice engine (sherpa-onnx + Parakeet v3 int8)
+
+De-risk script for the design at
+[`docs/superpowers/specs/2026-06-24-local-voice-dictation-design.md`](../../../docs/superpowers/specs/2026-06-24-local-voice-dictation-design.md).
+It answers the **go/no-go gate**: does `sherpa-onnx-node` load and decode Parakeet v3
+int8 under **plain Node *and* the project's Electron runtime** on Windows x64?
+
+## Result (2026-06-24) — ✅ GREEN LIGHT
+
+Run against Electron 42.2.0 (Node 24, ABI 146) and plain Node 22 (ABI 127):
+
+| Check | Result |
+|-------|--------|
+| Prebuilt `sherpa-onnx-win-x64` binary installs (no compile) | ✅ |
+| Loads under plain Node (ABI 127) — `node-load-test.cjs` | ✅ |
+| Loads under Electron 42 (ABI 146) — `electron-load-test.cjs`, issue #1945 | ✅ |
+| Parakeet v3 int8 builds + decodes under Electron — issue #2216 | ✅ ~1.9s build |
+| en/es/de/fr test WAVs transcribe correctly | ✅ |
+| Latency on this CPU | ✅ 16–23× realtime (RTF ~0.05; target ≥3×) |
+
+### Gotcha found (folded into the design)
+`sherpa.readWave()` throws **"External buffers are not allowed"** under Electron — V8
+rejects the external ArrayBuffer the native addon returns. The real app is unaffected:
+PCM arrives from the renderer's Web Audio as a normal V8-owned `Float32Array`. Rule:
+**never call `readWave` in the Electron engine process — feed JS-owned Float32 PCM.**
+`transcribe-js-pcm.cjs` parses the WAV in pure JS to mirror the production data path.
+
+## Reproduce
+
+```bash
+cd scripts/spikes/voice-engine
+npm install                       # pulls sherpa-onnx-node + sherpa-onnx-win-x64 (prebuilt)
+
+# Stage A — does the native binary load?
+node node-load-test.cjs                                   # plain Node
+../../../node_modules/electron/dist/electron.exe electron-load-test.cjs   # Electron ABI
+
+# Stage B — download Parakeet v3 int8 (~464 MB) and decode a known WAV
+curl -L -o parakeet-v3.tar.bz2 \
+  https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2
+tar -xf parakeet-v3.tar.bz2
+MODEL_DIR=./sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8 \
+  WAV_PATH=./sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/test_wavs/en.wav \
+  ../../../node_modules/electron/dist/electron.exe transcribe-js-pcm.cjs
+```
+
+(`node_modules/`, the archive, the extracted model dir, and `*-result.json` are git-ignored.)

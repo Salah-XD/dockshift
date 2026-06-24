@@ -328,11 +328,13 @@ voiceHoldToTalk: (v) => (typeof v === 'boolean' ? v : undefined),               
 
 ## 11. Verification plan (manual — no test runner)
 
-Phase 0 spike script (standalone Node, before UI work):
-- [ ] Install `sherpa-onnx-node`; confirm prebuilt Windows binary loads.
-- [ ] Load Parakeet v3 int8; transcribe a known WAV; assert non-empty, correct text.
-- [ ] Confirm it runs under the **Electron** runtime (ABI), not just plain Node.
-- [ ] Measure latency on a mid CPU (target ≥3× realtime).
+Phase 0 spike script — **✅ PASSED 2026-06-24** (scripts at `scripts/spikes/voice-engine/`):
+- [x] Install `sherpa-onnx-node`; confirm prebuilt Windows binary loads. — `sherpa-onnx-node@1.13.3` + prebuilt `sherpa-onnx-win-x64`, **no compile**.
+- [x] Load Parakeet v3 int8; transcribe a known WAV; assert non-empty, correct text. — en/es/de/fr all correct.
+- [x] Confirm it runs under the **Electron** runtime (ABI), not just plain Node. — loads + decodes under **Electron 42.2.0 (Node 24, ABI 146)**; issues #1945 and #2216 did **not** reproduce.
+- [x] Measure latency on a mid CPU (target ≥3× realtime). — **16–23× realtime** (RTF ~0.05), model build ~1.9 s.
+
+> **⚠️ Electron gotcha found in the spike (now a hard rule):** `sherpa.readWave()` throws *"External buffers are not allowed"* under Electron — V8 rejects the external ArrayBuffer the native addon returns. The app is unaffected because PCM arrives from the renderer as a normal V8-owned `Float32Array`. **Rule: never call `readWave` in the Electron engine process — only feed JS-owned Float32 PCM.** This also means the engine must build its input `Float32Array` carefully (alignment-safe; see Appendix A).
 
 Feature verification via `/verify-build` (packaged `.exe` from `release/`):
 - [ ] First-run model download shows progress, verifies checksum, extracts.
@@ -374,13 +376,13 @@ Picked for v1 vs deferred:
 
 ## 14. Phased implementation plan (build order)
 
-### Phase 0 — Engine spike (de-risk) — *blocking*
-- Standalone script: `sherpa-onnx-node` + Parakeet v3 int8 transcribes a WAV under Electron's ABI on Windows x64.
-- Decision gate: ✅ proceed with sherpa / ❌ fall back to whisper.cpp-server + `custom-openai`.
+### Phase 0 — Engine spike (de-risk) — *blocking* — ✅ **DONE 2026-06-24**
+- Standalone script: `sherpa-onnx-node` + Parakeet v3 int8 transcribes a WAV under Electron's ABI on Windows x64. → `scripts/spikes/voice-engine/`.
+- Decision gate: **✅ proceed with sherpa** (en/es/de/fr correct, 16–23× realtime under Electron 42). whisper.cpp-server fallback not needed.
 
 ### Phase 1 — Local engine in the Voice panel (kills "useless model")
 1. `electron-stt-models.js` — catalog + download/verify/extract; `stt:models:*` handlers; generalize progress channel.
-2. `electron-sherpa-engine.js` — `transcribePcm()`, model cache, teardown.
+2. ✅ **DONE** `electron-sherpa-engine.js` — `transcribePcm()`, warm per-model cache, idle teardown. Verified end-to-end under Electron 42 via `scripts/spikes/voice-engine/verify-engine.mjs` (cold build 2.3 s → warm 0 ms; en/es/fr correct). `sherpa-onnx-node@1.13.3` added to `dependencies`.
 3. Add `local-parakeet` + `local-whisper` providers; `localNative` flag; demote Vosk default → `DEFAULT_TRANSCRIPTION_PROVIDER_ID = 'local-parakeet'`.
 4. `useMicPcm.js`; wire `VoicePanel.jsx` to the PCM path; `transcription:transcribe` accepts `{ pcm, sampleRate }`.
 5. `VoiceSettings.jsx` model picker (download/switch/remove) + language-coverage prompt.
@@ -472,7 +474,15 @@ let recognizers = new Map(); // modelId -> OfflineRecognizer (warm cache)
 
 export async function transcribePcm({ modelId, pcmFloat32Base64, sampleRate }) {
   const rec = getOrCreateRecognizer(modelId);          // builds from catalog dir
-  const samples = new Float32Array(Buffer.from(pcmFloat32Base64, 'base64').buffer);
+  // NEVER use sherpa.readWave() here — it returns an EXTERNAL ArrayBuffer that
+  // Electron's V8 rejects ("External buffers are not allowed"). Feed a JS-owned
+  // Float32Array instead. Also: Buffer.from(base64).buffer can be a POOLED,
+  // mis-aligned ArrayBuffer, so slice out exactly our bytes into a fresh, 4-byte-
+  // aligned ArrayBuffer before viewing it as Float32. (Better still: send the PCM
+  // over IPC as a transferable Float32Array/ArrayBuffer and skip base64 entirely.)
+  const buf = Buffer.from(pcmFloat32Base64, 'base64');
+  const aligned = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+  const samples = new Float32Array(aligned);
   const stream = rec.createStream();
   stream.acceptWaveform({ sampleRate, samples });      // sherpa resamples to 16k
   rec.decode(stream);

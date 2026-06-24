@@ -1,0 +1,10 @@
+{
+  "name": "voice-engine-spike",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Phase 0 de-risk spike for DockShift local voice dictation (sherpa-onnx-node + Parakeet v3 int8). See ../../docs/superpowers/specs/2026-06-24-local-voice-dictation-design.md §11/§14.",
+  "main": "electron-load-test.cjs",
+  "dependencies": {
+    "sherpa-onnx-node": "1.13.3"
+  }
+}
