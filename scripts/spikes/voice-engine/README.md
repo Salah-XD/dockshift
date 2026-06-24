@@ -56,12 +56,17 @@ Beyond the Phase 0 spike, these drive the real modules / app (run with the proje
 | `verify-catalog.mjs` | `electron-stt-models.js` — SHA-256 verify, atomic extract, catalog→engine, real download |
 | `verify-provider.mjs` | `local-parakeet` provider through the real `runTranscription` executor |
 | `verify-modelswitch.mjs` | `settings.sttModel` → provider `modelId` override + same-family guard (Parakeet v3↔v2) |
+| `verify-migration.mjs` | `electron-stt-migration.js` — legacy `vosk-offline` → `local-parakeet` flip + model cleanup (plain Node, no Electron) |
 | `verify-app-e2e.cjs` | **Running app**: real IPC (`stt:models:*`, `transcription:transcribe` PCM) + **fake-mic** capture → transcript |
 | `verify-app-ui.cjs` | **Running app**: the `VoicePanel` React component mounts + renders the record control |
 | `verify-welcome.cjs` | **Running app**: welcome "Voice engine" step (model cards + accuracy/speed bars), default-provider flip, and `welcome:complete` persistence |
 
 The harnesses junction the already-extracted models into a fresh throwaway `--user-data-dir`
-(no 640 MB copies). Result (2026-06-24): modelswitch **4/4**, welcome **10/10**, e2e **6/6**, ui **4/4**.
+(no 640 MB copies). Result (2026-06-24): modelswitch **4/4**, migration **8/8**, welcome **10/10**, e2e **6/6**, ui **4/4**.
+
+`verify-migration.mjs` runs with plain `node` (no Electron) since the migration takes a
+`userDataDir` argument; the Vosk→Parakeet retirement was additionally confirmed on a real
+app boot (a seeded `vosk-offline` profile flips to `local-parakeet` on `app.on('ready')`).
 
 The two app harnesses need `npm install playwright` (no-save) and the Vite dev server
 (`npm run dev:vite`); they launch DockShift with Chromium's fake-audio device fed from a WAV:

@@ -1,4 +1,4 @@
-import { app, BrowserWindow, globalShortcut, screen, ipcMain, clipboard, nativeImage, shell, desktopCapturer, Tray, Menu, protocol } from 'electron';
+import { app, BrowserWindow, globalShortcut, screen, ipcMain, clipboard, nativeImage, shell, desktopCapturer, Tray, Menu } from 'electron';
 import { fileURLToPath } from 'url';
 import path from 'path';
 import fs from 'fs';
@@ -22,24 +22,13 @@ import {
 } from './electron-transcription-providers.js';
 import * as sttModels from './electron-stt-models.js';
 import * as sherpaEngine from './electron-sherpa-engine.js';
+import { migrateLegacyVoskProvider } from './electron-stt-migration.js';
 import { installShellIntegration, uninstallShellIntegration, isShellIntegrationInstalled, SHELL_INTEGRATION_VERSION } from './electron-shell-integration.js';
 // electron-updater is CommonJS — interop via the default import.
 import electronUpdater from 'electron-updater';
 const { autoUpdater } = electronUpdater;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
-// ─── Custom protocol for the Vosk model file ──────────────────────────────────
-// Must be registered as privileged BEFORE app.ready, so the renderer's `fetch`
-// can load `vosk-model://en-us-small` like any other URL. The model file lives
-// in userData/voskModels/ after first-use download; the actual handler in
-// app.ready maps the protocol path to that file.
-protocol.registerSchemesAsPrivileged([
-  {
-    scheme: 'vosk-model',
-    privileges: { standard: true, secure: true, supportFetchAPI: true, bypassCSP: true, stream: true },
-  },
-]);
 
 // ─── Load .env ────────────────────────────────────────────────────────────────
 // Minimal .env parser (no dotenv dependency). Handles `KEY=value`, surrounding
@@ -1199,145 +1188,9 @@ ipcMain.handle('ai:streamAbort', (_e, { streamId } = {}) => {
   return { ok: true };
 });
 
-// ─── Vosk offline speech model — download + cache + custom protocol ─────────
-//
-// The renderer's Voice panel uses `vosk-browser` to run speech recognition
-// entirely on-device (WASM in a Web Worker, no network). The model is too big
-// to ship in the installer, so it's downloaded once on first use, cached in
-// userData, and served back to the renderer via the `vosk-model://` protocol.
-
-const VOSK_MODELS = {
-  'en-us-small': {
-    url: 'https://ccoreilly.github.io/vosk-browser/models/vosk-model-small-en-us-0.15.tar.gz',
-    expectedBytes: 40 * 1024 * 1024, // ~40 MB — used for progress when the server omits Content-Length
-    label: 'English (small)',
-  },
-};
-
-const DEFAULT_VOSK_MODEL_ID = 'en-us-small';
-
-function voskModelsDir() {
-  return path.join(app.getPath('userData'), 'voskModels');
-}
-function voskModelPath(id) {
-  return path.join(voskModelsDir(), `${id}.tar.gz`);
-}
-function ensureVoskDir() {
-  fs.mkdirSync(voskModelsDir(), { recursive: true });
-}
-
-/**
- * Inspect what's cached on disk. The renderer calls this to decide whether to
- * show the "Download model" prompt or jump straight to recording.
- */
-ipcMain.handle('stt:voskModel:status', (_e, payload = {}) => {
-  const id = payload.id || DEFAULT_VOSK_MODEL_ID;
-  const meta = VOSK_MODELS[id];
-  if (!meta) return { id, installed: false, error: `Unknown model: ${id}` };
-  const filePath = voskModelPath(id);
-  let installed = false;
-  let sizeBytes = 0;
-  try {
-    const stat = fs.statSync(filePath);
-    // A partial download (renamed-in but smaller than expected) would be
-    // unusable; treat anything under 1 MB as "not installed" so the user
-    // re-downloads instead of seeing a cryptic Vosk worker error.
-    if (stat.size > 1024 * 1024) {
-      installed = true;
-      sizeBytes = stat.size;
-    }
-  } catch (_) { /* file missing */ }
-  return {
-    id,
-    installed,
-    sizeBytes,
-    expectedBytes: meta.expectedBytes,
-    label: meta.label,
-    protocolUrl: installed ? `vosk-model://${id}` : null,
-  };
-});
-
-/**
- * Stream the model archive from upstream to disk, pushing progress events to
- * the renderer as it goes. The renderer drives a single progress bar from these.
- * Uses fetch (Node 18+ global) so we get redirect-following for free.
- */
-ipcMain.handle('stt:voskModel:download', async (e, payload = {}) => {
-  const id = payload.id || DEFAULT_VOSK_MODEL_ID;
-  const meta = VOSK_MODELS[id];
-  if (!meta) return { ok: false, error: `Unknown model: ${id}` };
-
-  ensureVoskDir();
-  const dest = voskModelPath(id);
-  const tmp = `${dest}.part`;
-  // Wipe any prior aborted download so the partial file doesn't poison this one.
-  try { fs.unlinkSync(tmp); } catch (_) {}
-
-  const send = (phase, downloaded, total) => {
-    if (e.sender && !e.sender.isDestroyed()) {
-      e.sender.send('stt:voskModel:progress', { id, phase, downloaded, total });
-    }
-  };
-
-  try {
-    send('starting', 0, meta.expectedBytes);
-    const response = await fetch(meta.url, { redirect: 'follow' });
-    if (!response.ok || !response.body) {
-      throw new Error(`HTTP ${response.status}`);
-    }
-    const headerTotal = parseInt(response.headers.get('content-length') || '0', 10);
-    const total = headerTotal > 0 ? headerTotal : meta.expectedBytes;
-
-    const file = fs.createWriteStream(tmp);
-    const reader = response.body.getReader();
-    let downloaded = 0;
-    let lastProgressAt = 0;
-
-    // Backpressure-aware copy: await the write callback so the renderer can't
-    // outrun the disk on slow drives.
-    const writeChunk = (chunk) => new Promise((resolve, reject) => {
-      file.write(chunk, (err) => (err ? reject(err) : resolve()));
-    });
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      await writeChunk(value);
-      downloaded += value.length;
-      // Throttle: at most one progress message per ~100ms to keep IPC light.
-      const now = Date.now();
-      if (now - lastProgressAt > 100) {
-        send('downloading', downloaded, total);
-        lastProgressAt = now;
-      }
-    }
-    await new Promise((resolve, reject) => file.end((err) => (err ? reject(err) : resolve())));
-
-    // Atomic swap so a crash mid-download can't leave a half-file at the real path.
-    fs.renameSync(tmp, dest);
-    send('done', downloaded, total);
-    return { ok: true, protocolUrl: `vosk-model://${id}`, sizeBytes: downloaded };
-  } catch (err) {
-    try { fs.unlinkSync(tmp); } catch (_) {}
-    const msg = err?.message || 'Download failed';
-    send('error', 0, meta.expectedBytes);
-    return { ok: false, error: msg };
-  }
-});
-
-/**
- * Delete a cached model. Surfaced so power-users can free disk; not wired into
- * the UI yet but available via `window.electronAPI.invoke`.
- */
-ipcMain.handle('stt:voskModel:remove', (_e, payload = {}) => {
-  const id = payload.id || DEFAULT_VOSK_MODEL_ID;
-  try { fs.unlinkSync(voskModelPath(id)); return { ok: true }; }
-  catch (err) { return { ok: false, error: err.message }; }
-});
-
 // ─── Local STT model catalog (Parakeet / Whisper) ─────────────────────────────
-// Multi-model generalization of the Vosk downloader for the `localNative`
-// providers. Models live in userData/sttModels/<id>/ and are SHA-256 verified
+// On-device model management for the `localNative` providers.
+// Models live in userData/sttModels/<id>/ and are SHA-256 verified
 // before extraction. All logic lives in electron-stt-models.js; these handlers
 // are thin adapters that forward download progress over `stt:model:progress`.
 
@@ -2763,32 +2616,12 @@ function sendToRenderer(channel, payload) {
 }
 
 app.on('ready', () => {
-  const settings = readSettings();
+  // One-time: retire the legacy on-device Vosk engine. Anyone still pointed at
+  // `vosk-offline` (the flip to the Parakeet default only reaches profiles with
+  // no saved provider) is moved to the current default before anything reads it.
+  migrateLegacyVoskProvider(app.getPath('userData'), DEFAULT_TRANSCRIPTION_PROVIDER_ID);
 
-  // Serve cached Vosk model files to the renderer via a custom protocol so
-  // `vosk-browser`'s fetch can load them with no special CORS dance and no
-  // ad-hoc local HTTP server. The path component (or hostname) selects which
-  // model — only one shipped today, but the shape supports more.
-  protocol.handle('vosk-model', async (request) => {
-    try {
-      const url = new URL(request.url);
-      const id = (url.hostname || url.pathname.replace(/^\//, '').split('/')[0] || '').trim();
-      const meta = VOSK_MODELS[id];
-      if (!meta) return new Response('Unknown model', { status: 404 });
-      const filePath = voskModelPath(id);
-      const buffer = await fs.promises.readFile(filePath);
-      return new Response(buffer, {
-        status: 200,
-        headers: {
-          'Content-Type': 'application/gzip',
-          'Content-Length': String(buffer.length),
-          'Cache-Control': 'no-store',
-        },
-      });
-    } catch (err) {
-      return new Response(`Model load failed: ${err.message}`, { status: 500 });
-    }
-  });
+  const settings = readSettings();
 
   // Auto-updater and heartbeat are dock-independent — start them either way so
   // a user who's stuck on the welcome screen still gets background updates.

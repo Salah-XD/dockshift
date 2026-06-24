@@ -4,9 +4,9 @@ import { useCallback, useRef, useState } from 'react';
  * Capture the microphone as mono Float32 PCM in the renderer, for the
  * `localNative` (sherpa-onnx) transcription path.
  *
- * Unlike the cloud path (MediaRecorder → webm container → base64) and the Vosk
- * path (streams straight into a WASM recognizer), this accumulates the whole
- * utterance as raw Float32 samples and returns them on stop. Main base64-decodes
+ * Unlike the cloud path (MediaRecorder → webm container → base64), this
+ * accumulates the whole utterance as raw Float32 samples and returns them on
+ * stop. Main base64-decodes
  * them and feeds the engine directly — sherpa resamples to 16 kHz internally, so
  * we keep the AudioContext's native rate and report it alongside the samples.
  *
@@ -51,8 +51,7 @@ export function useMicPcm() {
     chunksRef.current = [];
 
     const source = ctx.createMediaStreamSource(stream);
-    // ScriptProcessorNode is deprecated but works reliably in Chromium/Electron
-    // and matches the existing Vosk capture graph in this file.
+    // ScriptProcessorNode is deprecated but works reliably in Chromium/Electron.
     const processor = ctx.createScriptProcessor(4096, 1, 1);
     processor.onaudioprocess = (e) => {
       const input = e.inputBuffer.getChannelData(0);

@@ -94,33 +94,11 @@ export default function VoicePanel({ isOpen, onClose, anchorRect }) {
   const supportsAutoDetect = activeProvider
     ? !!activeProvider.capabilities?.autoDetectLanguage
     : true; // assume yes until catalog loads, so the UI doesn't flicker
-  // Client-side providers (e.g. on-device Vosk) bypass the MediaRecorder + IPC
-  // round-trip and stream audio directly into a WASM recognizer in the renderer.
-  const isClientSide = !!activeProvider?.clientSide;
   // localNative providers (Parakeet / Whisper via sherpa) capture raw Float32 PCM
   // in the renderer and decode it in the main process. They need a one-time model
-  // download, like Vosk, but a much larger one.
+  // download, a much larger one than the cloud providers' zero.
   const isLocalNative = !!activeProvider?.localNative;
   const localModelId = activeProvider?.modelId || null;
-
-  // ── On-device speech state ────────────────────────────────────────────────
-  // The Vosk model is heavy to load (parses a ~40 MB tar.gz and spins up a
-  // WebWorker), so we keep the Model alive across recordings in a ref and only
-  // tear it down on unmount. A fresh Recognizer is created per recording.
-  const [modelInstalled, setModelInstalled] = useState(false);
-  const [modelBytes, setModelBytes] = useState(0);
-  const [downloadState, setDownloadState] = useState(null);
-  // ^ null | { phase: 'starting'|'downloading'|'done'|'error', downloaded, total }
-  const [isLoadingModel, setIsLoadingModel] = useState(false);
-  const voskModelRef = useRef(null);
-  const voskRecognizerRef = useRef(null);
-  const audioCtxRef = useRef(null);
-  const processorRef = useRef(null);
-  // The committed prefix the recognizer's interim results extend. Lives in a
-  // ref so onresult handlers (which capture an initial closure) always read
-  // the current value without re-binding.
-  const transcriptBaseRef = useRef('');
-  const partialRef = useRef('');
 
   // ── localNative (sherpa) on-device state ───────────────────────────────────
   const mic = useMicPcm();
@@ -168,42 +146,12 @@ export default function VoicePanel({ isOpen, onClose, anchorRect }) {
     api?.invoke?.('settings:set', { settings: { sttLanguage: next } })?.catch(() => {});
   }, [api, supportsAutoDetect]);
 
-  /**
-   * Tear down the live on-device recording pipeline — recognizer, audio nodes,
-   * mic stream. Idempotent; called from the stop button, panel-close effect,
-   * and unmount cleanup. Leaves the loaded Vosk model alive so a follow-up
-   * recording in the same session starts instantly.
-   */
-  const stopVoskPipeline = useCallback(() => {
-    if (voskRecognizerRef.current) {
-      try { voskRecognizerRef.current.retrieveFinalResult(); } catch (_) {}
-      try { voskRecognizerRef.current.remove(); } catch (_) {}
-      voskRecognizerRef.current = null;
-    }
-    if (processorRef.current) {
-      try { processorRef.current.disconnect(); } catch (_) {}
-      processorRef.current.onaudioprocess = null;
-      processorRef.current = null;
-    }
-    if (audioCtxRef.current) {
-      try { audioCtxRef.current.close(); } catch (_) {}
-      audioCtxRef.current = null;
-    }
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((t) => t.stop());
-      streamRef.current = null;
-    }
-  }, []);
-
   // Stop a live recording when the panel closes — releases the mic and avoids
   // a transcription firing after the user dismissed the panel.
   useEffect(() => {
     if (isOpen) return;
     if (mediaRecorderRef.current && isRecording) {
       try { mediaRecorderRef.current.stop(); } catch (_) {}
-    }
-    if (isRecording && voskRecognizerRef.current) {
-      stopVoskPipeline();
     }
     if (isRecording && mic.isCapturing) {
       mic.cancel(); // localNative path: release the mic, discard the clip
@@ -213,46 +161,15 @@ export default function VoicePanel({ isOpen, onClose, anchorRect }) {
       streamRef.current.getTracks().forEach((t) => t.stop());
       streamRef.current = null;
     }
-  }, [isOpen, isRecording, stopVoskPipeline, mic]);
+  }, [isOpen, isRecording, mic]);
 
-  // Cleanup on unmount: belt-and-braces release of the mic stream + the
-  // Vosk model (which owns a Web Worker).
+  // Cleanup on unmount: belt-and-braces release of any live mic stream.
   useEffect(() => () => {
-    stopVoskPipeline();
-    if (voskModelRef.current) {
-      try { voskModelRef.current.terminate(); } catch (_) {}
-      voskModelRef.current = null;
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
     }
-  }, [stopVoskPipeline]);
-
-  // Check whether the on-device model is already cached on disk. Runs when the
-  // panel opens onto a client-side provider so we can render either the
-  // download CTA or the normal record button without flicker.
-  useEffect(() => {
-    if (!isOpen || !api || !isClientSide) return undefined;
-    let cancelled = false;
-    api.invoke('stt:voskModel:status').then((res) => {
-      if (cancelled) return;
-      setModelInstalled(!!res?.installed);
-      setModelBytes(res?.sizeBytes || 0);
-    }).catch(() => {});
-    return () => { cancelled = true; };
-  }, [isOpen, api, isClientSide]);
-
-  // Stream the one-time download progress from main into the progress UI. The
-  // generic `api.on` returns an unsubscribe — return it so each remount of the
-  // panel re-binds cleanly.
-  useEffect(() => {
-    if (!api?.on) return undefined;
-    const unsub = api.on('stt:voskModel:progress', (data) => {
-      setDownloadState(data);
-      if (data?.phase === 'done') {
-        setModelInstalled(true);
-        setModelBytes(data.downloaded || 0);
-      }
-    });
-    return () => { try { unsub?.(); } catch (_) {} };
-  }, [api]);
+  }, []);
 
   // localNative model: check whether the provider's model is on disk yet, and
   // auto-download it for every user if it's missing (no manual click needed).
@@ -290,17 +207,6 @@ export default function VoicePanel({ isOpen, onClose, anchorRect }) {
     });
     return () => { try { unsub?.(); } catch (_) {} };
   }, [api, localModelId]);
-
-  /** Kick off the one-time model download. Progress comes back via the push channel. */
-  const handleDownloadModel = useCallback(async () => {
-    setError(null);
-    setDownloadState({ phase: 'starting', downloaded: 0, total: 0 });
-    const res = await api.invoke('stt:voskModel:download').catch((err) => ({ ok: false, error: err?.message }));
-    if (!res?.ok) {
-      setError(res?.error || 'Could not download the speech model.');
-      setDownloadState({ phase: 'error', downloaded: 0, total: 0 });
-    }
-  }, [api]);
 
   /** One-time download of a localNative (sherpa) model. Progress via push channel. */
   const handleDownloadLocalModel = useCallback(async () => {
@@ -348,116 +254,11 @@ export default function VoicePanel({ isOpen, onClose, anchorRect }) {
     }
   }, [api, mic]);
 
-  /**
-   * Lazily load the on-device Vosk model. Returns the cached instance on
-   * subsequent calls so toggling record back on doesn't re-parse the archive.
-   * The model URL is served by the main process's `vosk-model://` protocol.
-   */
-  const loadVoskModel = useCallback(async () => {
-    if (voskModelRef.current) return voskModelRef.current;
-    setIsLoadingModel(true);
-    try {
-      const { createModel } = await import('vosk-browser');
-      const model = await createModel('vosk-model://en-us-small');
-      voskModelRef.current = model;
-      return model;
-    } finally {
-      setIsLoadingModel(false);
-    }
-  }, []);
-
-  /**
-   * Drive on-device speech recognition. Audio flows mic → MediaStream →
-   * AudioContext → ScriptProcessor → Vosk recognizer, all in the renderer.
-   * Final results append to the committed transcript; partial results render
-   * as a live tail and get replaced (not appended) on each update.
-   */
-  const startVoskRecognition = useCallback(async () => {
-    if (!modelInstalled) {
-      setError('The speech model isn\'t downloaded yet. Click "Download model" first.');
-      return;
-    }
-
-    let model;
-    try {
-      model = await loadVoskModel();
-    } catch (err) {
-      setError(`Could not load the speech model: ${err?.message || err}`);
-      return;
-    }
-
-    let stream;
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    } catch (_) {
-      setError('Microphone access denied. Allow it in Windows Settings → Privacy & security → Microphone.');
-      return;
-    }
-    streamRef.current = stream;
-
-    // AudioContext picks its own sample rate (usually 48 kHz). Vosk handles
-    // the resample down to the model's training rate internally when given an
-    // AudioBuffer, so we don't hard-pin a rate here.
-    const AudioCtor = window.AudioContext || window.webkitAudioContext;
-    const audioCtx = new AudioCtor();
-    audioCtxRef.current = audioCtx;
-
-    const recognizer = new model.KaldiRecognizer(audioCtx.sampleRate);
-    recognizer.setWords(true);
-    voskRecognizerRef.current = recognizer;
-
-    // Capture the prefix to extend (any text already in the transcript) so
-    // interim/partial results render correctly when the user hits record
-    // twice in the same session.
-    transcriptBaseRef.current = transcript ? transcript + ' ' : '';
-    partialRef.current = '';
-
-    recognizer.on('result', (msg) => {
-      const text = msg?.result?.text || '';
-      if (!text) return;
-      // Final segment: append to the base and reset the interim tail.
-      transcriptBaseRef.current = transcriptBaseRef.current + text + ' ';
-      partialRef.current = '';
-      setTranscript(transcriptBaseRef.current.trimEnd());
-    });
-    recognizer.on('partialresult', (msg) => {
-      const partial = msg?.result?.partial || '';
-      partialRef.current = partial;
-      setTranscript((transcriptBaseRef.current + partial).trimEnd());
-    });
-    recognizer.on('error', (msg) => {
-      setError(msg?.error || 'Speech recognition error.');
-    });
-
-    const source = audioCtx.createMediaStreamSource(stream);
-    // ScriptProcessorNode is deprecated in favour of AudioWorklet but still
-    // works in Chromium; the smaller buffer keeps interim results snappy.
-    const processor = audioCtx.createScriptProcessor(4096, 1, 1);
-    processor.onaudioprocess = (event) => {
-      try {
-        const rec = voskRecognizerRef.current;
-        if (rec) rec.acceptWaveform(event.inputBuffer);
-      } catch (_) { /* recognizer was torn down mid-tick */ }
-    };
-    // ScriptProcessor only fires while it's part of the audio graph, but we
-    // don't want to actually hear the mic — route through a muted gain so the
-    // node runs without feeding the speakers.
-    const muteGain = audioCtx.createGain();
-    muteGain.gain.value = 0;
-    source.connect(processor);
-    processor.connect(muteGain);
-    muteGain.connect(audioCtx.destination);
-    processorRef.current = processor;
-
-    setIsRecording(true);
-  }, [modelInstalled, loadVoskModel, transcript]);
-
   const toggleRecording = useCallback(async () => {
     if (isRecording) {
       // Stop whichever pathway is active.
       if (isLocalNative) { await transcribeLocalPcm(); return; }
       try { mediaRecorderRef.current?.stop(); } catch (_) {}
-      if (voskRecognizerRef.current) stopVoskPipeline();
       setIsRecording(false);
       return;
     }
@@ -477,11 +278,6 @@ export default function VoicePanel({ isOpen, onClose, anchorRect }) {
       } catch (_) {
         setError('Microphone access denied or not supported.');
       }
-      return;
-    }
-
-    if (isClientSide) {
-      await startVoskRecognition();
       return;
     }
 
@@ -553,7 +349,7 @@ export default function VoicePanel({ isOpen, onClose, anchorRect }) {
       stream.getTracks().forEach((t) => t.stop());
       setError(`Could not start recording: ${err.message}`);
     }
-  }, [isRecording, language, api, isClientSide, isLocalNative, localModelInstalled, mic, transcribeLocalPcm, startVoskRecognition, stopVoskPipeline]);
+  }, [isRecording, language, api, isLocalNative, localModelInstalled, mic, transcribeLocalPcm]);
 
   const handleCopy = useCallback(() => {
     if (!transcript) return;
@@ -575,15 +371,15 @@ export default function VoicePanel({ isOpen, onClose, anchorRect }) {
 
   if (!isOpen || !anchorRect) return null;
 
-  // Both on-device tiers (Vosk clientSide + sherpa localNative) gate recording
-  // behind a one-time model download. Unify the conditions so the record button,
-  // status line, and download CTA share one source of truth.
-  const modelMissing = (isClientSide && !modelInstalled) || (isLocalNative && !localModelInstalled);
+  // On-device (sherpa localNative) gates recording behind a one-time model
+  // download; cloud providers have no model to fetch. Unify so the record
+  // button, status line, and download CTA share one source of truth.
+  const modelMissing = isLocalNative && !localModelInstalled;
   const showRecordUI = !modelMissing;
-  const activeDownloadState = isLocalNative ? localDownloadState : downloadState;
-  const downloadMB = isLocalNative
-    ? (localModelStatus?.downloadBytes ? Math.round(localModelStatus.downloadBytes / 1024 / 1024) : 620)
-    : 40;
+  const activeDownloadState = localDownloadState;
+  const downloadMB = localModelStatus?.downloadBytes
+    ? Math.round(localModelStatus.downloadBytes / 1024 / 1024)
+    : 620;
   const downloadPhaseLabel = activeDownloadState?.phase === 'verifying'
     ? 'Verifying model…'
     : activeDownloadState?.phase === 'extracting'
@@ -691,29 +487,26 @@ export default function VoicePanel({ isOpen, onClose, anchorRect }) {
               On-device speech needs a one-time ~{downloadMB} MB model download. After that
               it works offline with no API key.
             </div>
-            <Button variant="primary" onClick={isLocalNative ? handleDownloadLocalModel : handleDownloadModel}>
+            <Button variant="primary" onClick={handleDownloadLocalModel}>
               Download model
             </Button>
           </Callout>
         )
       )}
 
-      {/* Record button — disabled while the model is missing or loading, so the
-          user can't trigger a doomed recording. */}
+      {/* Record button — shown once any required on-device model is present. */}
       {showRecordUI && (
         <div style={{ display: 'flex', justifyContent: 'center', padding: 'var(--ds-space-3) 0' }}>
           <button
             onClick={toggleRecording}
             title={isRecording ? 'Stop recording' : 'Start recording'}
-            disabled={isLoadingModel}
             style={{
               width: 68,
               height: 68,
               borderRadius: '50%',
               background: isRecording ? 'var(--ds-danger)' : 'var(--ds-accent)',
               border: 'none',
-              cursor: isLoadingModel ? 'wait' : 'pointer',
-              opacity: isLoadingModel ? 0.6 : 1,
+              cursor: 'pointer',
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'center',
@@ -749,8 +542,6 @@ export default function VoicePanel({ isOpen, onClose, anchorRect }) {
               <span style={{ width: 12, height: 12, border: '2px solid var(--ds-accent-cyan)', borderTopColor: 'transparent', borderRadius: '50%', animation: 'spin 1s linear infinite' }} />
               Transcribing…
             </span>
-          ) : isLoadingModel ? (
-            <span style={{ color: 'var(--ds-accent-cyan)' }}>Loading speech model…</span>
           ) : (
             'Click to start recording'
           )}

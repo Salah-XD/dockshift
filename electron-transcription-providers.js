@@ -125,55 +125,12 @@ function normalizeLanguage(language, format) {
 /* ─── Provider definitions ──────────────────────────────────────────────── */
 
 /**
- * On-device speech recognition powered by Vosk (WASM in a Web Worker). Runs
- * entirely in the renderer — once the small English model has been downloaded
- * to the user's profile, audio never leaves the device and no network is used.
- *
- * Special "client-side" provider: the main-process `transcribe()` below is
- * unreachable on the happy path — VoicePanel detects `clientSide: true` and
- * drives the recognizer directly. The function exists only so accidental
- * routing or generic probes fail with a clear, user-readable error.
- */
-const voskOffline = {
-  id: 'vosk-offline',
-  label: 'On-device (offline)',
-  keyName: null,
-  keyless: true,
-  clientSide: true,
-  description: 'Runs entirely on your computer. No internet, no API key, no audio uploaded.',
-  setupHint: 'A small speech model (~40 MB) downloads the first time you use it. After that, voice works offline.',
-  docsUrl: null,
-  defaultEndpoint: '',
-  supportsCustomEndpoint: false,
-  supportedAudioMimes: [], // unused — renderer streams the mic directly into Vosk
-  languageHintFormat: 'bcp-47',
-  capabilities: {
-    autoDetectLanguage: false, // The current model is English-only
-    streaming: true,           // Delivers interim + final results live
-    multilingual: false,
-    timestamps: false,
-    diarization: false,
-  },
-
-  async transcribe() {
-    throw new TranscriptionError(
-      'On-device speech runs in the Voice panel itself, not as a background transcription job.',
-      'capability',
-    );
-  },
-
-  async testConnection() {
-    return { ok: true, info: 'On-device — no network credentials to test.' };
-  },
-};
-
-/**
  * On-device, high-accuracy speech via sherpa-onnx running in the MAIN process.
  *
- * These are the `localNative` tier: unlike Vosk (`clientSide`, runs in the
- * renderer) they receive **Float32 PCM** (base64) from the renderer and decode
- * it through `electron-sherpa-engine.js`. The model is resolved + checked via
- * the catalog in `electron-stt-models.js`. No API key, no audio leaves the device.
+ * These are the `localNative` tier: they receive **Float32 PCM** (base64) from
+ * the renderer and decode it through `electron-sherpa-engine.js`. The model is
+ * resolved + checked via the catalog in `electron-stt-models.js`. No API key,
+ * no audio leaves the device.
  *
  * The factory exists because Parakeet and Whisper providers are identical except
  * for their backing model id; keeping the contract in one place avoids drift.
@@ -901,7 +858,6 @@ const customCompat = {
 export const TRANSCRIPTION_PROVIDERS = {
   [localParakeet.id]: localParakeet,
   [localWhisper.id]: localWhisper,
-  [voskOffline.id]: voskOffline,
   [openaiWhisper.id]: openaiWhisper,
   [groqWhisper.id]: groqWhisper,
   [deepgram.id]: deepgram,
@@ -927,11 +883,6 @@ export const TRANSCRIPTION_PROVIDER_LIST = Object.values(TRANSCRIPTION_PROVIDERS
   label: p.label,
   keyName: p.keyName,
   keyless: p.keyless,
-  // `clientSide: true` tells the renderer to handle transcription locally
-  // (e.g. Windows Speech via SpeechRecognition) instead of recording audio
-  // and posting it to main. Any provider without this stays on the
-  // MediaRecorder → IPC → main path.
-  clientSide: !!p.clientSide,
   // `localNative: true` providers decode in the main process and need the
   // renderer to capture raw Float32 PCM (via useMicPcm) and post it with
   // `{ pcm: true, sampleRate }`. `modelId` ties the provider to a catalog model.

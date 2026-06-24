@@ -55,10 +55,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
       'transcription:providers',
       'transcription:transcribe',
       'transcription:test',
-      // On-device speech model management (Vosk WASM)
-      'stt:voskModel:status',
-      'stt:voskModel:download',
-      'stt:voskModel:remove',
       // On-device speech model catalog (Parakeet / Whisper, sherpa-onnx)
       'stt:models:list',
       'stt:model:status',
