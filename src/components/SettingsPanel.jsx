@@ -24,6 +24,12 @@ import HotkeyRecorder from './HotkeyRecorder';
 import UpdateStatus from './UpdateStatus';
 
 const DEFAULT_TOGGLE_SHORTCUT = 'Control+Shift+D';
+const DEFAULT_PILL_SHORTCUT = 'Control+Shift+Space';
+
+const INSERT_MODE_OPTIONS = [
+  { value: 'paste', label: 'Auto-paste' },
+  { value: 'clipboard', label: 'Copy only' },
+];
 
 const THEME_OPTIONS = [
   { value: 'light', label: 'Light', icon: <SunIcon size={13} /> },
@@ -178,6 +184,34 @@ export default function SettingsPanel({ isOpen, onClose, anchorRect }) {
                   }
                   return r;
                 }}
+              />
+            }
+          />
+          <SettingRow
+            label="Dictation pill"
+            description="Press to start dictating, press again to stop — text goes to the focused app"
+            control={
+              <HotkeyRecorder
+                value={settings.voicePillShortcut || DEFAULT_PILL_SHORTCUT}
+                defaultValue={DEFAULT_PILL_SHORTCUT}
+                onChange={async (accel) => {
+                  const r = await api?.invoke?.('voice:pill:hotkey:set', { accelerator: accel });
+                  if (r?.ok) {
+                    setSettings((prev) => ({ ...prev, voicePillShortcut: r.accelerator }));
+                  }
+                  return r;
+                }}
+              />
+            }
+          />
+          <SettingRow
+            label="Dictation output"
+            description="Auto-paste into the focused app, or just copy the text to the clipboard"
+            control={
+              <SegmentedControl
+                value={settings.voiceInsertMode || 'paste'}
+                onChange={(v) => update('voiceInsertMode', v)}
+                options={INSERT_MODE_OPTIONS}
               />
             }
           />

@@ -23,6 +23,7 @@ import {
 import * as sttModels from './electron-stt-models.js';
 import * as sherpaEngine from './electron-sherpa-engine.js';
 import { migrateLegacyVoskProvider } from './electron-stt-migration.js';
+import { insertText } from './electron-paste.js';
 import { installShellIntegration, uninstallShellIntegration, isShellIntegrationInstalled, SHELL_INTEGRATION_VERSION } from './electron-shell-integration.js';
 // electron-updater is CommonJS — interop via the default import.
 import electronUpdater from 'electron-updater';
@@ -709,6 +710,16 @@ function startDock() {
   if (!r.ok && saved) {
     registerToggleShortcut(DEFAULT_TOGGLE_SHORTCUT);
   }
+
+  // Voice dictation pill: register its global hotkey and pre-create the (hidden)
+  // pill window so the first press is instant and the renderer is already
+  // subscribed to voice:pill:start before the hotkey can fire.
+  const savedPill = readSettings().voicePillShortcut;
+  const pr = registerPillShortcut(savedPill || DEFAULT_PILL_SHORTCUT);
+  if (!pr.ok && savedPill) {
+    registerPillShortcut(DEFAULT_PILL_SHORTCUT);
+  }
+  createPillWindow();
 }
 
 // In-memory mirror of the persisted dock layout. The renderer pushes updates
@@ -1320,17 +1331,18 @@ ipcMain.handle('transcription:providers', () => {
  * `providerId` is accepted so the renderer can transcribe with a specific
  * provider without persisting it — used by the "Test Connection" probe.
  */
-ipcMain.handle('transcription:transcribe', async (_e, payload = {}) => {
-  const { audio, mimeType, language, providerId, sampleRate } = payload;
-  if (!audio) {
-    return { ok: false, error: 'No audio data received.', code: 'config' };
-  }
+/**
+ * Resolve the active (or requested) STT provider and run a transcription.
+ * Shared by the Voice panel (`transcription:transcribe`) and the dictation pill
+ * (`voice:pill:transcribe`) so provider resolution + error normalization live in
+ * one place. Returns the same `{ ok, text, ... }` shape both callers expose.
+ */
+async function transcribeAudio({ audio, mimeType, language, providerId, sampleRate }) {
+  if (!audio) return { ok: false, error: 'No audio data received.', code: 'config' };
   const provider = providerId
     ? (getTranscriptionProvider(providerId) || getActiveSttProvider())
     : getActiveSttProvider();
-  if (!provider) {
-    return { ok: false, error: 'No transcription provider configured.', code: 'config' };
-  }
+  if (!provider) return { ok: false, error: 'No transcription provider configured.', code: 'config' };
   try {
     const result = await runTranscription({
       provider,
@@ -1354,10 +1366,46 @@ ipcMain.handle('transcription:transcribe', async (_e, payload = {}) => {
     };
   } catch (err) {
     const code = err instanceof TranscriptionError ? err.code : 'unknown';
-    console.warn('[transcription:transcribe]', provider.id, code, err.message);
+    console.warn('[transcribe]', provider.id, code, err.message);
     return { ok: false, error: err.message || 'Transcription failed.', code, provider: provider.id };
   }
+}
+
+ipcMain.handle('transcription:transcribe', (_e, payload = {}) => transcribeAudio(payload));
+
+// ─── Voice dictation pill (Phase 2) ───────────────────────────────────────────
+// The pill renderer captures PCM and posts it here; we transcribe via the same
+// provider path as the panel, then auto-insert the text into the focused app
+// (clipboard + synthetic Ctrl+V, with the prior clipboard restored). Because the
+// pill window is non-activating (`showInactive`), the user's target app keeps
+// focus, so the paste lands there.
+ipcMain.handle('voice:pill:transcribe', async (_e, payload = {}) => {
+  const res = await transcribeAudio({
+    audio: payload.audio,
+    sampleRate: payload.sampleRate,
+    language: payload.language ?? null,
+    mimeType: 'audio/webm',
+  });
+  if (!res.ok) return res;
+  if (!res.text) return { ...res, pasted: false, insertMode: 'none' };
+
+  const mode = readSettings().voiceInsertMode === 'clipboard' ? 'clipboard' : 'paste';
+  let pasted = false;
+  try {
+    ({ pasted } = await insertText(res.text, { mode, clipboard }));
+  } catch (err) {
+    // Paste failed (e.g. UIPI: target is an elevated window) — fall back to
+    // leaving the text on the clipboard so the user can paste it manually.
+    console.warn('[voice:pill] auto-insert failed:', err?.message);
+    try { clipboard.writeText(res.text); } catch (_) { /* clipboard busy */ }
+    pasted = false;
+  }
+  return { ...res, pasted, insertMode: mode };
 });
+
+// Pill asks to be hidden — after it shows the ✓/error flash, or on Esc / blur.
+ipcMain.handle('voice:pill:dismiss', () => { hidePill(); return { ok: true }; });
+ipcMain.handle('voice:pill:cancel', () => { hidePill(); return { ok: true }; });
 
 /**
  * Test a provider's credentials + endpoint without performing a real
@@ -1587,6 +1635,14 @@ const SETTINGS_SCHEMA = {
   sttProvider: (v) => (typeof v === 'string' && v.length <= 32 ? v : undefined),
   sttModel: (v) => (typeof v === 'string' && v.length <= 48 ? v : undefined),
   sttLanguage: (v) => (typeof v === 'string' && v.length <= 16 ? v : undefined),
+  // Voice dictation pill (Phase 2): auto-insert mode, global hotkey, remembered position.
+  voiceInsertMode: (v) => (['paste', 'clipboard'].includes(v) ? v : undefined),
+  voicePillShortcut: (v) => (typeof v === 'string' && v.length <= 64 ? v : undefined),
+  voicePillPos: (v) => {
+    if (!v || typeof v !== 'object' || Array.isArray(v)) return undefined;
+    const x = Number(v.x), y = Number(v.y);
+    return (Number.isFinite(x) && Number.isFinite(y)) ? { x: Math.trunc(x), y: Math.trunc(y) } : undefined;
+  },
   sttEndpoints: (v) => {
     if (!v || typeof v !== 'object' || Array.isArray(v)) return undefined;
     const out = {};
@@ -2148,6 +2204,128 @@ ipcMain.handle('settings:hotkey:set', (_e, { accelerator } = {}) => {
       ...readSettings(),
       toggleDockShortcut: result.accelerator,
     });
+  }
+  return result;
+});
+
+// ─── Voice dictation pill: window + global hotkey ─────────────────────────────
+// A tiny non-activating overlay window. Created hidden at startDock and reused.
+// Because it never takes focus (`focusable:false` + `showInactive`), the OS
+// foreground window stays the user's target app, so the synthetic Ctrl+V from
+// `voice:pill:transcribe` pastes there.
+const DEFAULT_PILL_SHORTCUT = 'Control+Shift+Space';
+let pillWindow = null;
+let pillRecording = false;
+let currentPillShortcut = null;
+
+function createPillWindow() {
+  if (pillWindow && !pillWindow.isDestroyed()) return pillWindow;
+  pillWindow = new BrowserWindow({
+    width: 340,
+    height: 110,
+    show: false,
+    frame: false,
+    transparent: true,
+    resizable: false,
+    movable: true,
+    focusable: false,
+    skipTaskbar: true,
+    alwaysOnTop: true,
+    fullscreenable: false,
+    maximizable: false,
+    minimizable: false,
+    hasShadow: false,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: true,
+    },
+  });
+  pillWindow.setAlwaysOnTop(true, 'screen-saver');
+
+  const isDevelopment = process.env.NODE_ENV === 'development' || !app.isPackaged;
+  const devPort = process.env.VITE_PORT || '5173';
+  const url = isDevelopment
+    ? `http://localhost:${devPort}/#pill`
+    : `file://${path.join(__dirname, 'dist', 'index.html')}#pill`;
+  pillWindow.loadURL(url);
+
+  // Remember where the user drags the pill (-webkit-app-region: drag moves it).
+  pillWindow.on('moved', () => {
+    if (!pillWindow || pillWindow.isDestroyed()) return;
+    const [x, y] = pillWindow.getPosition();
+    writeJsonAtomic(settingsFile(), { ...readSettings(), voicePillPos: { x, y } });
+  });
+  pillWindow.on('closed', () => { pillWindow = null; pillRecording = false; });
+  return pillWindow;
+}
+
+function positionPill(win) {
+  const [w, h] = win.getSize();
+  const saved = readSettings().voicePillPos;
+  const { workArea } = screen.getPrimaryDisplay();
+  let x, y;
+  if (saved && typeof saved.x === 'number' && typeof saved.y === 'number') {
+    x = saved.x; y = saved.y;
+  } else {
+    // Default: bottom-center of the primary work area, Handy-style.
+    x = Math.round(workArea.x + (workArea.width - w) / 2);
+    y = Math.round(workArea.y + workArea.height - h - 80);
+  }
+  win.setPosition(x, y);
+}
+
+function hidePill() {
+  pillRecording = false;
+  if (pillWindow && !pillWindow.isDestroyed()) pillWindow.hide();
+}
+
+/**
+ * Toggle dictation (v1 toggle mode — no native key-up hook): first hotkey press
+ * shows the pill and starts capture; second press stops it and the renderer
+ * finalizes + transcribes via `voice:pill:transcribe`.
+ */
+function togglePillRecording() {
+  const win = createPillWindow();
+  if (!pillRecording) {
+    positionPill(win);
+    win.showInactive();
+    pillRecording = true;
+    win.webContents.send('voice:pill:start');
+  } else {
+    pillRecording = false;
+    win.webContents.send('voice:pill:stop');
+  }
+}
+
+function registerPillShortcut(accelerator) {
+  const accel = String(accelerator || '').trim() || DEFAULT_PILL_SHORTCUT;
+  if (currentPillShortcut && currentPillShortcut !== accel) {
+    globalShortcut.unregister(currentPillShortcut);
+  } else if (currentPillShortcut === accel && globalShortcut.isRegistered(accel)) {
+    return { ok: true, accelerator: accel };
+  }
+  let ok = false;
+  try {
+    ok = globalShortcut.register(accel, togglePillRecording);
+  } catch (err) {
+    return { ok: false, error: err.message || 'Invalid shortcut' };
+  }
+  if (!ok) {
+    if (currentPillShortcut && currentPillShortcut !== accel) {
+      globalShortcut.register(currentPillShortcut, togglePillRecording);
+    }
+    return { ok: false, error: 'Shortcut is already in use by another app' };
+  }
+  currentPillShortcut = accel;
+  return { ok: true, accelerator: accel };
+}
+
+ipcMain.handle('voice:pill:hotkey:set', (_e, { accelerator } = {}) => {
+  const result = registerPillShortcut(accelerator);
+  if (result.ok) {
+    writeJsonAtomic(settingsFile(), { ...readSettings(), voicePillShortcut: result.accelerator });
   }
   return result;
 });

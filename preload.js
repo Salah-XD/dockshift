@@ -60,6 +60,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
       'stt:model:status',
       'stt:model:download',
       'stt:model:remove',
+      // Voice dictation pill (global hotkey → transcribe → auto-insert)
+      'voice:pill:transcribe',
+      'voice:pill:dismiss',
+      'voice:pill:cancel',
+      'voice:pill:hotkey:set',
       // Secrets (encrypted API key storage — names only cross this boundary)
       'secrets:set',
       'secrets:has',
