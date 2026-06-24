@@ -44,4 +44,28 @@ MODEL_DIR=./sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8 \
   ../../../node_modules/electron/dist/electron.exe transcribe-js-pcm.cjs
 ```
 
-(`node_modules/`, the archive, the extracted model dir, and `*-result.json` are git-ignored.)
+(`node_modules/`, the archive, the extracted model dir, `*-result.json`, and `*.png` are git-ignored.)
+
+## Module + app verification harnesses
+
+Beyond the Phase 0 spike, these drive the real modules / app (run with the project's `electron.exe`, except the e2e/ui which use Node + Playwright):
+
+| Harness | Verifies |
+|---------|----------|
+| `verify-engine.mjs` | `electron-sherpa-engine.js` — warm cache (cold→warm), multilingual decode |
+| `verify-catalog.mjs` | `electron-stt-models.js` — SHA-256 verify, atomic extract, catalog→engine, real download |
+| `verify-provider.mjs` | `local-parakeet` provider through the real `runTranscription` executor |
+| `verify-app-e2e.cjs` | **Running app**: real IPC (`stt:models:*`, `transcription:transcribe` PCM) + **fake-mic** capture → transcript |
+| `verify-app-ui.cjs` | **Running app**: the `VoicePanel` React component mounts + renders the record control |
+
+The two app harnesses need `npm install playwright` (no-save) and the Vite dev server
+(`npm run dev:vite`); they launch DockShift with Chromium's fake-audio device fed from a WAV:
+
+```bash
+npm install playwright --no-save          # PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+npm run dev:vite &                         # renderer on :5173
+MODEL_SRC=<extracted model> WAV=<en.wav> TEST_UD=<temp> node verify-app-e2e.cjs
+TEST_UD=<same temp> WAV=<en.wav> node verify-app-ui.cjs
+```
+
+Result (2026-06-24): e2e **6/6** (incl. fake-mic 48 kHz → correct transcript), ui **4/4**.

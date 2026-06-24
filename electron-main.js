@@ -20,6 +20,8 @@ import {
   testTranscriptionProvider,
   TranscriptionError,
 } from './electron-transcription-providers.js';
+import * as sttModels from './electron-stt-models.js';
+import * as sherpaEngine from './electron-sherpa-engine.js';
 import { installShellIntegration, uninstallShellIntegration, isShellIntegrationInstalled, SHELL_INTEGRATION_VERSION } from './electron-shell-integration.js';
 // electron-updater is CommonJS — interop via the default import.
 import electronUpdater from 'electron-updater';
@@ -1333,6 +1335,44 @@ ipcMain.handle('stt:voskModel:remove', (_e, payload = {}) => {
   catch (err) { return { ok: false, error: err.message }; }
 });
 
+// ─── Local STT model catalog (Parakeet / Whisper) ─────────────────────────────
+// Multi-model generalization of the Vosk downloader for the `localNative`
+// providers. Models live in userData/sttModels/<id>/ and are SHA-256 verified
+// before extraction. All logic lives in electron-stt-models.js; these handlers
+// are thin adapters that forward download progress over `stt:model:progress`.
+
+ipcMain.handle('stt:models:list', () => {
+  try { return { ok: true, models: sttModels.listModels() }; }
+  catch (err) { return { ok: false, error: err.message, models: [] }; }
+});
+
+ipcMain.handle('stt:model:status', (_e, payload = {}) => {
+  const id = payload.id || sttModels.DEFAULT_MODEL_ID;
+  try { return { ok: true, ...sttModels.getStatus(id) }; }
+  catch (err) { return { ok: false, error: err.message }; }
+});
+
+ipcMain.handle('stt:model:download', async (e, payload = {}) => {
+  const id = payload.id || sttModels.DEFAULT_MODEL_ID;
+  const send = (p) => {
+    if (e.sender && !e.sender.isDestroyed()) e.sender.send('stt:model:progress', p);
+  };
+  try {
+    return await sttModels.downloadModel(id, { onProgress: send });
+  } catch (err) {
+    send({ id, phase: 'error', downloaded: 0, total: 0 });
+    return { ok: false, error: err.message };
+  }
+});
+
+ipcMain.handle('stt:model:remove', (_e, payload = {}) => {
+  const id = payload.id || sttModels.DEFAULT_MODEL_ID;
+  // Unload from RAM first so the model files aren't locked while we delete them.
+  try { sherpaEngine.unload(id); } catch (_) { /* not loaded */ }
+  try { return sttModels.removeModel(id); }
+  catch (err) { return { ok: false, error: err.message }; }
+});
+
 // ─── Voice-to-Text (transcription) IPC ────────────────────────────────────────
 //
 // The Voice panel and Voice settings UI go through this namespace exclusively;
@@ -1404,7 +1444,7 @@ ipcMain.handle('transcription:providers', () => {
  * provider without persisting it — used by the "Test Connection" probe.
  */
 ipcMain.handle('transcription:transcribe', async (_e, payload = {}) => {
-  const { audio, mimeType, language, providerId } = payload;
+  const { audio, mimeType, language, providerId, sampleRate } = payload;
   if (!audio) {
     return { ok: false, error: 'No audio data received.', code: 'config' };
   }
@@ -1421,6 +1461,9 @@ ipcMain.handle('transcription:transcribe', async (_e, payload = {}) => {
       endpoint: getSttEndpoint(provider.id),
       audioBase64: audio,
       mimeType: mimeType || 'audio/webm',
+      // localNative providers receive raw Float32 PCM + its capture rate; cloud
+      // providers ignore sampleRate and use the container's mimeType.
+      sampleRate: typeof sampleRate === 'number' ? sampleRate : undefined,
       language: language ?? null,
     });
     return {
@@ -2738,6 +2781,8 @@ app.on('activate', () => {
 app.on('will-quit', () => {
   globalShortcut.unregisterAll();
   if (clipboardHistory) clipboardHistory.stop();
+  // Unload any warm sherpa STT model (frees ~600 MB of native memory).
+  try { sherpaEngine.unloadAll(); } catch (_) { /* never loaded */ }
   if (tray && !tray.isDestroyed()) {
     tray.destroy();
     tray = null;

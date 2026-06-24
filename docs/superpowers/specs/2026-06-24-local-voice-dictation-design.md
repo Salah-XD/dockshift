@@ -387,11 +387,12 @@ Picked for v1 vs deferred:
 2. ✅ **DONE** `electron-sherpa-engine.js` — `transcribePcm()`, warm per-model cache, idle teardown. Verified (`verify-engine.mjs`; cold 2.3 s → warm 0 ms; en/es/fr). `sherpa-onnx-node@1.13.3` in `dependencies`; `build.files` + `asarUnpack` updated.
 3. ✅ **DONE** `local-parakeet` + `local-whisper` providers via a `makeLocalNativeProvider` factory; `localNative` flag; `runTranscription` threads `sampleRate`; list exposes `localNative`/`modelId`. Verified 10/10 (`verify-provider.mjs`, full executor→engine). **Default NOT flipped yet** — kept `vosk-offline` until the renderer learns the PCM path (step 4), so new installs aren't routed somewhere the panel can't drive. Flip `DEFAULT_TRANSCRIPTION_PROVIDER_ID = 'local-parakeet'` as part of step 4.
 
-**Renderer + IPC wiring — ⏳ REMAINING (needs the running app + mic + a model download to verify; do interactively):**
-4. `stt:models:*` + `voice:*` IPC handlers in electron-main.js; `transcription:transcribe` accepts `{ pcm: true, sampleRate }`; `useMicPcm.js` (Web Audio → mono Float32); wire `VoicePanel.jsx` to the PCM path; then flip the default provider.
-5. `VoiceSettings.jsx` model picker (download/switch/remove) + language-coverage prompt (uses `modelSupportsLanguage`).
-6. preload allowlist (three-place rule) + settings validators (`sttModel`, …).
-7. `/verify-build` for panel transcription (packaging: confirm `asarUnpack` ships the native addon).
+**Renderer + IPC wiring — ✅ DONE + verified in the running app (Playwright + Electron, fake-mic):**
+4. ✅ **DONE** `stt:models:*` IPC handlers in electron-main.js (list/status/download/remove) + `stt:model:progress` push; `transcription:transcribe` accepts `{ pcm: true, sampleRate }`; `useMicPcm.js` (Web Audio → mono Float32, base64); `VoicePanel.jsx` localNative path (model-download gate + record → PCM → transcribe); engine `unloadAll()` on quit. preload allowlist updated (three-place rule; IPC-sync hook clean). Verified: `verify-app-e2e.cjs` **6/6** (real IPC + **fake-mic 48 kHz → correct transcript**) and `verify-app-ui.cjs` **4/4** (VoicePanel mounts + renders the record control).
+   - ⏳ **Deliberate decision left to the maintainer:** flip `DEFAULT_TRANSCRIPTION_PROVIDER_ID = 'local-parakeet'`. Not done autonomously — it changes the default for *all* installs (existing Vosk users would see a one-time ~620 MB download). One-line change; the providers are fully functional and selectable today.
+5. VoiceSettings model picker: **not needed for v1** — `local-parakeet` is keyless and already selectable in the provider-agnostic `VoiceSettings.jsx`; the per-model download/record UX lives in `VoicePanel.jsx`. A multi-model picker (parakeet ↔ whisper switch, language-coverage prompt via `modelSupportsLanguage`) is a follow-up once whisper checksums are pinned.
+6. ✅ **DONE** preload allowlist + IPC handlers in sync. (`sttModel` settings validator deferred — the provider pins its own modelId for v1; no per-provider model switching yet.)
+7. ⏳ **REMAINING:** `/verify-build` — package via electron-builder and confirm `asarUnpack` ships the sherpa native addon in the `.exe` (manual gate per AGENTS.md; the e2e above ran against the Vite dev renderer + unpacked Electron, not the packaged build).
 
 ### Phase 2 — The Ctrl+Space pill (headline UX)
 1. Pill window (`focusable:false`, `showInactive`) + `pill.html` Vite entry; `VoicePill.jsx`.

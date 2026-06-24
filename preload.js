@@ -59,6 +59,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
       'stt:voskModel:status',
       'stt:voskModel:download',
       'stt:voskModel:remove',
+      // On-device speech model catalog (Parakeet / Whisper, sherpa-onnx)
+      'stt:models:list',
+      'stt:model:status',
+      'stt:model:download',
+      'stt:model:remove',
       // Secrets (encrypted API key storage — names only cross this boundary)
       'secrets:set',
       'secrets:has',
