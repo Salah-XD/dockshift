@@ -7,6 +7,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-06-29
+### Fixed
+- **v0.10.0 would not start once installed** (`ERR_MODULE_NOT_FOUND` for
+  `electron-stt-migration.js` at launch). Two new main-process modules shipped in 0.10.0
+  (`electron-stt-migration.js`, `electron-paste.js`) were missing from the packaged
+  `app.asar` because electron-builder's `build.files` was a hand-maintained per-file
+  allowlist. Replaced it with an `electron-*.js` glob so every main-process module is
+  bundled automatically — closing a foot-gun that had already caused a startup crash once
+  (v0.9.0). Verified by launching the packaged executable, not just by packaging it.
+
 ## [0.10.0] - 2026-06-29
 ### Added
 - **On-device voice dictation.** Completely local speech-to-text powered by

@@ -1,6 +1,6 @@
 {
   "name": "dockshift",
-  "version": "0.10.0",
+  "version": "0.10.1",
   "description": "An open-source floating productivity dock for Windows",
   "main": "electron-main.js",
   "type": "module",
@@ -73,14 +73,7 @@
     "nodeGypRebuild": false,
     "files": [
       "dist/**/*",
-      "electron-main.js",
-      "electron-ai-providers.js",
-      "electron-transcription-providers.js",
-      "electron-sherpa-engine.js",
-      "electron-stt-models.js",
-      "electron-persistence.js",
-      "electron-secrets.js",
-      "electron-shell-integration.js",
+      "electron-*.js",
       "preload.js",
       "src/workspace/**/*",
       "assets/icon.ico",
