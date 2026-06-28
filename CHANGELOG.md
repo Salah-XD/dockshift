@@ -7,6 +7,36 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-06-29
+### Added
+- **On-device voice dictation.** Completely local speech-to-text powered by
+  [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) running NVIDIA's **Parakeet TDT
+  0.6B v3** model — 25 European languages, auto-detected, on the CPU. Your audio never
+  leaves the machine; there is no cloud round-trip and no API key. This is now the default
+  speech engine for every install.
+- **Dictation pill — global hotkey `Ctrl+Shift+Space`.** Press it anywhere, speak, and your
+  words are transcribed on-device and auto-pasted straight into whatever app is focused. A
+  floating, draggable, non-activating pill shows live mic level and status, then dismisses
+  itself. The hotkey is rebindable, and output is switchable between **auto-paste** and
+  **copy-to-clipboard** in Settings → Shortcuts.
+- **Voice-engine picker in the welcome flow.** Choose your model on first run with at-a-glance
+  accuracy/speed bars and a multilingual badge; the chosen model downloads in the background.
+- **Model integrity verification.** Downloaded speech models are SHA-256 verified before first
+  use, with atomic extract and a warm-cache engine that idles down when unused.
+
+### Changed
+- **Default speech engine is now on-device Parakeet** (previously the in-browser Vosk small
+  model, which was too inaccurate to be useful).
+
+### Removed
+- **Retired the legacy Vosk engine** in full — provider, in-browser WASM, the `vosk-model://`
+  protocol, the `vosk-browser` dependency, and its CSP allowances.
+
+### Fixed
+- **Upgrade no longer leaves you stuck on "Loading speech model…".** Users carrying a saved
+  legacy engine setting are automatically migrated to on-device Parakeet on next launch, and
+  the old Vosk model files are cleaned up to reclaim disk.
+
 ## [0.9.4] - 2026-05-26
 ## [0.9.3] - 2026-05-15
 ## [0.9.2] - 2026-05-15

@@ -18,7 +18,7 @@ more — always within reach, never in your way.
 [![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D6?style=flat-square&labelColor=1A1B26&logo=windows11&logoColor=4CC2FF)](https://www.microsoft.com/windows)
 
 [![License](https://img.shields.io/badge/License-MIT-22C55E?style=flat-square&labelColor=1A1B26)](LICENSE)
-[![Version](https://img.shields.io/badge/Version-0.9.4_beta-7AA2F7?style=flat-square&labelColor=1A1B26)](https://github.com/Salah-XD/dockshift/releases)
+[![Version](https://img.shields.io/badge/Version-0.10.0_beta-7AA2F7?style=flat-square&labelColor=1A1B26)](https://github.com/Salah-XD/dockshift/releases)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-BB9AF7?style=flat-square&labelColor=1A1B26)](#-contributing)
 [![Star on GitHub](https://img.shields.io/badge/Star_on_GitHub-F5A623?style=flat-square&labelColor=1A1B26&logo=github&logoColor=white)](https://github.com/Salah-XD/dockshift)
 
